@@ -1,0 +1,21 @@
+# Core dependencies for photochronos
+tqdm>=4.66.0
+exifread>=3.0.0
+tzlocal>=5.0.0
+pywin32>=306  # for win32com.propsys (video metadata)
+
+# Enhanced CLI experience
+rich>=13.7.0  # Better terminal UI, progress bars, tables
+click>=8.1.7  # Modern CLI framework
+inquirer>=3.2.0  # Interactive prompts and selections
+
+# File handling and deduplication
+xxhash>=3.4.0  # Faster hashing for deduplication
+send2trash>=1.8.0  # Safe file deletion
+pathvalidate>=3.2.0  # Path validation and sanitization
+
+# Image processing (for thumbnail generation, metadata)
+pillow>=10.0.0
+
+# Date/time handling enhancements
+python-dateutil>=2.8.2
