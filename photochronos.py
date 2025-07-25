@@ -162,16 +162,9 @@ class PhotoChronos:
         
         self.print_progress("Discovering files...")
         
-        for path in self.args.path:
-            # Resolve to handle trailing slashes and relative paths properly
-            try:
-                path_obj = path.resolve()
-            except Exception as e:
-                self.print_warning(f"Invalid path '{path}': {e}")
-                continue
-                
+        for path_obj in self.args.path:
             if not path_obj.exists():
-                self.print_warning(f"Path does not exist: {path}")
+                self.print_warning(f"Path does not exist: {path_obj}")
                 continue
                 
             # Use pathlib for better cross-platform support
@@ -668,7 +661,7 @@ def main():
     
     parser.add_argument(
         'path', 
-        type=pathlib.Path, 
+        type=pathlib.Path,
         nargs='+',
         help='Directories to process'
     )
