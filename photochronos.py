@@ -163,7 +163,13 @@ class PhotoChronos:
         self.print_progress("Discovering files...")
         
         for path in self.args.path:
-            path_obj = pathlib.Path(path)
+            # Resolve to handle trailing slashes and relative paths properly
+            try:
+                path_obj = path.resolve()
+            except Exception as e:
+                self.print_warning(f"Invalid path '{path}': {e}")
+                continue
+                
             if not path_obj.exists():
                 self.print_warning(f"Path does not exist: {path}")
                 continue
