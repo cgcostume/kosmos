@@ -69,6 +69,11 @@ class FileInfo:
     file_hash: Optional[str] = None
     is_duplicate: bool = False
     duplicate_of: Optional[pathlib.Path] = None
+    issues: List[str] = None
+    
+    def __post_init__(self):
+        if self.issues is None:
+            self.issues = []
 
 class PhotoChronos:
     """Main application class for photo/video organization"""
@@ -77,6 +82,7 @@ class PhotoChronos:
         self.args = args
         self.files: List[FileInfo] = []
         self.duplicates: Dict[str, List[FileInfo]] = defaultdict(list)
+        self.issues: List[str] = []
         
         # Validate inputs during initialization
         self._validate_inputs()
@@ -86,8 +92,8 @@ class PhotoChronos:
         print(f"{Fore.WHITE}{message}{Style.RESET_ALL}")
     
     def print_config(self, message: str):
-        """Print configuration info in dim blue"""
-        print(f"{Fore.LIGHTBLUE_EX}{Style.DIM}{message}{Style.RESET_ALL}")
+        """Print configuration info in light cyan"""
+        print(f"{Fore.CYAN}{message}{Style.RESET_ALL}")
     
     def print_progress(self, message: str):
         """Print intermediate/progress messages in dim white"""
@@ -98,7 +104,7 @@ class PhotoChronos:
         print(f"{Fore.GREEN}{message}{Style.RESET_ALL}")
     
     def print_warning(self, message: str):
-        """Print warning messages in yellow"""
+        """Print warning messages in strong yellow"""
         print(f"{Fore.YELLOW}{message}{Style.RESET_ALL}")
     
     def print_error(self, message: str):
@@ -171,7 +177,7 @@ class PhotoChronos:
         
         return files
 
-    def extract_date_from_image(self, file_path: pathlib.Path) -> Optional[datetime.datetime]:
+    def extract_date_from_image(self, file_path: pathlib.Path, file_info: FileInfo) -> Optional[datetime.datetime]:
         """Extract creation date from image EXIF data"""
         date_tags = [
             'EXIF DateTimeOriginal', 'DateTimeOriginal',
@@ -192,13 +198,17 @@ class PhotoChronos:
                             continue
                             
         except Exception as e:
-            self.print_warning(f"Could not read EXIF from {file_path.name}: {e}")
+            file_info.issues.append(f"Could not read EXIF data: {e}")
+        
+        if not file_info.issues:
+            file_info.issues.append("No EXIF date found")
         
         return None
 
-    def extract_date_from_video(self, file_path: pathlib.Path) -> Optional[datetime.datetime]:
+    def extract_date_from_video(self, file_path: pathlib.Path, file_info: FileInfo) -> Optional[datetime.datetime]:
         """Extract creation date from video metadata (Windows only)"""
         if not WINDOWS_METADATA:
+            file_info.issues.append("Video metadata not available (Windows COM required)")
             return None
             
         try:
@@ -211,27 +221,31 @@ class PhotoChronos:
                 return local_date.replace(tzinfo=None)
                 
         except Exception as e:
-            self.print_warning(f"Could not read video metadata from {file_path.name}: {e}")
+            file_info.issues.append(f"Could not read video metadata: {e}")
+        
+        if not file_info.issues:
+            file_info.issues.append("No video metadata found")
         
         return None
 
-    def get_file_date(self, file_path: pathlib.Path) -> datetime.datetime:
+    def get_file_date(self, file_path: pathlib.Path, file_info: FileInfo) -> datetime.datetime:
         """Get the creation date of a file, trying multiple methods"""
         file_ext = file_path.suffix.lower().lstrip('.')
         
         # Try EXIF for images
         if file_ext in IMAGE_EXTENSIONS:
-            exif_date = self.extract_date_from_image(file_path)
+            exif_date = self.extract_date_from_image(file_path, file_info)
             if exif_date:
                 return exif_date
         
         # Try video metadata for videos
         elif file_ext in VIDEO_EXTENSIONS:
-            video_date = self.extract_date_from_video(file_path)
+            video_date = self.extract_date_from_video(file_path, file_info)
             if video_date:
                 return video_date
         
         # Fallback to file modification time
+        file_info.issues.append("Using file modification time (no metadata found)")
         return datetime.datetime.fromtimestamp(file_path.stat().st_mtime)
 
     def analyze_files(self, file_paths: List[pathlib.Path]) -> List[FileInfo]:
@@ -248,23 +262,63 @@ class PhotoChronos:
                 file_ext = file_path.suffix.lower().lstrip('.')
                 file_type = 'image' if file_ext in IMAGE_EXTENSIONS else 'video'
                 
+                # Create file_info first, then get date (which may add issues)
                 file_info = FileInfo(
                     path=file_path,
                     original_name=file_path.name,
                     file_size=file_path.stat().st_size,
-                    date_created=self.get_file_date(file_path),
+                    date_created=datetime.datetime.now(),  # Temporary, will be updated
                     file_type=file_type
                 )
+                
+                # Get actual date (this may add issues to file_info)
+                file_info.date_created = self.get_file_date(file_path, file_info)
                 
                 files.append(file_info)
                 
             except Exception as e:
-                self.print_warning(f"Error analyzing {file_path.name}: {e}")
+                # Create a file_info for failed analysis too
+                file_info = FileInfo(
+                    path=file_path,
+                    original_name=file_path.name,
+                    file_size=0,
+                    date_created=datetime.datetime.fromtimestamp(file_path.stat().st_mtime),
+                    file_type='unknown'
+                )
+                file_info.issues.append(f"Analysis failed: {e}")
+                files.append(file_info)
             
             pbar.update(1)
         
         pbar.close()
         return files
+    
+    def show_issues_report(self, files: List[FileInfo]):
+        """Show summary of issues encountered during analysis"""
+        files_with_issues = [f for f in files if f.issues]
+        
+        if not files_with_issues:
+            self.print_config("No issues found during analysis")
+            return
+        
+        print()  # Empty line before issues
+        # Use orange for issue headers
+        print(f"{Fore.LIGHTRED_EX}Issues found with {len(files_with_issues)} files:{Style.RESET_ALL}")
+        
+        # Group issues by type for cleaner display
+        issue_groups = defaultdict(list)
+        for file_info in files_with_issues:
+            for issue in file_info.issues:
+                issue_groups[issue].append(file_info.original_name)
+        
+        for issue, filenames in issue_groups.items():
+            print(f"{Fore.LIGHTRED_EX}  {issue} ({len(filenames)} files):{Style.RESET_ALL}")
+            # Show first few filenames, then "and X more" if too many
+            show_count = min(3, len(filenames))
+            for filename in filenames[:show_count]:
+                print(f"{Fore.LIGHTRED_EX}    - {filename}{Style.RESET_ALL}")
+            if len(filenames) > show_count:
+                print(f"{Fore.LIGHTRED_EX}    - ... and {len(filenames) - show_count} more{Style.RESET_ALL}")
     
     def generate_new_filename(self, file_info: FileInfo) -> str:
         """Generate new filename based on date created.
@@ -407,7 +461,10 @@ class PhotoChronos:
         used_target_paths: Set[str] = set()
         planned_operations: Dict[str, FileInfo] = {}
         
-        for file_info in sorted_files:
+        # Progress bar for planning phase
+        pbar = tqdm(sorted_files, desc="Planning operations", unit="file", leave=False)
+        
+        for file_info in pbar:
             base_new_name = self.generate_new_filename(file_info)
             
             # Resolve naming conflicts and get final target path
@@ -423,6 +480,7 @@ class PhotoChronos:
             if current_path_str != target_path_str and not file_info.is_duplicate:
                 planned_operations[current_path_str] = file_info
         
+        pbar.close()
         return planned_operations
     
     def show_duplicates(self, files: List[FileInfo]):
@@ -430,9 +488,11 @@ class PhotoChronos:
         duplicates = [f for f in files if f.is_duplicate]
         
         if not duplicates:
+            self.print_config("No duplicates found")
             return
         
-        self.print_warning(f"\nFound {len(duplicates)} duplicate files (can be safely deleted):")
+        print()  # Empty line before duplicates
+        self.print_warning(f"Found {len(duplicates)} duplicate files (can be safely deleted):")
         
         # Group by directory for cleaner display
         by_directory = defaultdict(list)
@@ -440,25 +500,45 @@ class PhotoChronos:
             by_directory[str(file_info.path.parent)].append(file_info)
         
         for directory, files in sorted(by_directory.items()):
-            self.print_config(f"\nDirectory: {directory}")
+            self.print_config(f"  Directory: {directory}")
             for file_info in files:
-                self.print_warning(f"  {file_info.original_name} (duplicate of {file_info.duplicate_of.name})")
+                self.print_warning(f"    {file_info.original_name} (duplicate of {file_info.duplicate_of.name})")
         
-        self.print_config(f"\nThese {len(duplicates)} files are identical to files that already exist in the target locations.")
-        self.print_config("They can be safely deleted after the organization is complete.")
+        self.print_config(f"  These {len(duplicates)} files are identical to existing target files and can be safely deleted.")
+        print()  # Empty line after duplicates
     
-    def prompt_user_confirmation(self, planned_operations: Dict[str, FileInfo], duplicates_count: int) -> bool:
-        """Prompt user for confirmation before proceeding"""
-        if not planned_operations and duplicates_count == 0:
+    def prompt_issues_confirmation(self, files: List[FileInfo], duplicates_count: int) -> bool:
+        """First confirmation: Acknowledge issues and duplicates"""
+        files_with_issues = [f for f in files if f.issues]
+        
+        if not files_with_issues and duplicates_count == 0:
             return True
         
         print()  # Empty line before prompt
         
-        if planned_operations:
-            self.print_result(f"Ready to process {len(planned_operations)} files")
+        if files_with_issues:
+            self.print_config(f"{len(files_with_issues)} files had analysis issues (shown above)")
         
         if duplicates_count > 0:
-            self.print_config(f"Found {duplicates_count} duplicates that will be left for manual cleanup")
+            self.print_config(f"{duplicates_count} duplicate files found (will be left for manual cleanup)")
+        
+        if not files_with_issues and not duplicates_count:
+            return True
+            
+        try:
+            response = input("\nContinue despite these issues? [y/N]: ").strip().lower()
+            return response in ['y', 'yes']
+        except KeyboardInterrupt:
+            print("\nOperation cancelled by user")
+            return False
+    
+    def prompt_operations_confirmation(self, planned_operations: Dict[str, FileInfo]) -> bool:
+        """Second confirmation: Confirm planned operations"""
+        if not planned_operations:
+            return True
+        
+        print()  # Empty line before prompt
+        self.print_result(f"Ready to process {len(planned_operations)} files")
         
         try:
             response = input("\nProceed with these operations? [y/N]: ").strip().lower()
@@ -472,13 +552,14 @@ class PhotoChronos:
         if not planned_operations:
             return True
         
-        self.print_progress("Executing file operations...")
+        operation_verb = "Copying" if self.args.copy else "Moving"
+        self.print_progress(f"{operation_verb} files...")
         
         # Create progress bar for operations
         pbar = tqdm(total=len(planned_operations), desc="Processing files", unit="files", leave=True)
         
-        success_count = 0
-        error_count = 0
+        success_files = []
+        failed_files = []
         
         for file_info in planned_operations.values():
             try:
@@ -486,36 +567,48 @@ class PhotoChronos:
                 target_dir = file_info.target_path.parent
                 target_dir.mkdir(parents=True, exist_ok=True)
                 
-                # Try rename first (faster for same drive), fallback to copy+delete for cross-drive
-                try:
-                    file_info.path.rename(file_info.target_path)
-                except OSError as rename_error:
-                    if "different disk drive" in str(rename_error) or rename_error.errno == 17:
-                        # Cross-drive operation - use copy + delete
-                        shutil.copy2(file_info.path, file_info.target_path)
-                        file_info.path.unlink()  # Delete original after successful copy
-                    else:
-                        raise  # Re-raise if it's a different error
+                if self.args.copy:
+                    # Copy mode - always copy, never delete original
+                    shutil.copy2(file_info.path, file_info.target_path)
+                else:
+                    # Move mode - try rename first, fallback to copy+delete for cross-drive
+                    try:
+                        file_info.path.rename(file_info.target_path)
+                    except OSError as rename_error:
+                        if "different disk drive" in str(rename_error) or rename_error.errno == 17:
+                            # Cross-drive operation - use copy + delete
+                            shutil.copy2(file_info.path, file_info.target_path)
+                            file_info.path.unlink()  # Delete original after successful copy
+                        else:
+                            raise  # Re-raise if it's a different error
                 
-                success_count += 1
+                success_files.append(file_info.original_name)
                 
             except Exception as e:
-                self.print_error(f"Failed to process {file_info.original_name}: {e}")
-                error_count += 1
+                failed_files.append((file_info.original_name, str(e)))
             
             pbar.update(1)
         
         pbar.close()
         
-        # Report results
-        if success_count > 0:
-            self.print_success(f"Successfully processed {success_count} files")
+        # Show operation summary
+        self.show_operation_summary(success_files, failed_files, operation_verb.lower())
         
-        if error_count > 0:
-            self.print_error(f"Failed to process {error_count} files")
-            return False
+        return len(failed_files) == 0
+    
+    def show_operation_summary(self, success_files: List[str], failed_files: List[Tuple[str, str]], operation_verb: str):
+        """Show summary of file operations"""
+        if success_files:
+            self.print_success(f"Successfully {operation_verb} {len(success_files)} files")
         
-        return True
+        if failed_files:
+            self.print_error(f"Failed to process {len(failed_files)} files:")
+            # Show first few failures with details
+            show_count = min(5, len(failed_files))
+            for filename, error in failed_files[:show_count]:
+                self.print_config(f"  - {filename}: {error}")
+            if len(failed_files) > show_count:
+                self.print_config(f"  - ... and {len(failed_files) - show_count} more failures")
     
     def show_rename_preview(self, planned_operations: Dict[str, FileInfo]):
         """Show preview of planned operations grouped by target directory"""
@@ -555,6 +648,7 @@ class PhotoChronos:
         self.print_config(f"  Organize into folders: {'Yes' if self.args.organize else 'No'}")
         if self.args.output_dir:
             self.print_config(f"  Output directory: {self.args.output_dir}")
+        self.print_config(f"  Operation mode: {'Copy' if self.args.copy else 'Move'}")
         if not WINDOWS_METADATA:
             self.print_config("  Video metadata: Limited (Windows COM not available)")
         print()  # Empty line after config
@@ -604,6 +698,12 @@ def main():
         help='Base directory for organized output (default: same as source)'
     )
     
+    parser.add_argument(
+        '--copy',
+        action='store_true',
+        help='Copy files instead of moving them (leaves originals intact)'
+    )
+    
     args = parser.parse_args()
     
     # Initialize PhotoChronos
@@ -633,25 +733,31 @@ def main():
     # Plan operations (renames and/or organization)
     planned_operations = app.plan_renames(files)
     
-    # Show duplicates that can be deleted
+    # First confirmation step: Show issues and duplicates
+    app.show_issues_report(files)
     app.show_duplicates(files)
     
-    # Show preview of planned changes
+    # Count duplicates for confirmation prompt
+    duplicates_count = sum(1 for f in files if f.is_duplicate)
+    
+    # First confirmation: Acknowledge issues and duplicates
+    if not app.prompt_issues_confirmation(files, duplicates_count):
+        app.print_config("Operation cancelled by user")
+        return 0
+    
+    # Second confirmation step: Show operation preview
     app.show_rename_preview(planned_operations)
     
     if args.dry_run:
         app.print_config("\nDry run mode - no files were modified")
         return 0
     
-    # Count duplicates for confirmation prompt
-    duplicates_count = sum(1 for f in files if f.is_duplicate)
-    
     if not planned_operations and duplicates_count == 0:
         app.print_success("All files are already in correct locations with correct names")
         return 0
     
-    # Get user confirmation
-    if not app.prompt_user_confirmation(planned_operations, duplicates_count):
+    # Second confirmation: Confirm operations
+    if not app.prompt_operations_confirmation(planned_operations):
         app.print_config("Operation cancelled by user")
         return 0
     
