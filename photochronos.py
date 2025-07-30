@@ -27,16 +27,12 @@ from dataclasses import dataclass
 from tqdm import tqdm
 import exifread
 from tzlocal import get_localzone
-import colorama
-from colorama import Fore, Style, Back
-
 # Local imports
 from duplicate_detector import DuplicateDetector
 from file_analyzer import FileAnalyzer, FileAnalysisResult
 from file_operations import FileOperations, OperationType
+from console_ui import ConsoleUI
 
-# Initialize colorama for cross-platform color support
-colorama.init()
 
 # Fix Windows console encoding for Unicode characters
 if sys.platform == "win32":
@@ -125,6 +121,9 @@ class PhotoChronos:
         # Initialize file operations
         self.file_operations = FileOperations()
         
+        # Initialize console UI
+        self.ui = ConsoleUI()
+        
         # Extend family devices with user-provided patterns
         if args.family_devices:
             FAMILY_DEVICES['user_defined'] = args.family_devices
@@ -132,37 +131,6 @@ class PhotoChronos:
         # Validate inputs during initialization
         self._validate_inputs()
         
-    def print_result(self, message: str):
-        """Print primary result/output in white"""
-        print(f"{Fore.WHITE}{message}{Style.RESET_ALL}")
-    
-    def print_config(self, message: str):
-        """Print configuration info in light cyan"""
-        print(f"{Fore.CYAN}{message}{Style.RESET_ALL}")
-    
-    def print_info(self, message: str):
-        """Print neutral information in dim white (gray)"""
-        print(f"{Fore.WHITE}{Style.DIM}{message}{Style.RESET_ALL}")
-    
-    def print_tip(self, message: str):
-        """Print tips and hints in magenta"""
-        print(f"{Fore.MAGENTA}{message}{Style.RESET_ALL}")
-    
-    def print_progress(self, message: str):
-        """Print intermediate/progress messages in dim white"""
-        print(f"{Fore.WHITE}{Style.DIM}{message}{Style.RESET_ALL}")
-    
-    def print_success(self, message: str):
-        """Print success messages in green"""
-        print(f"{Fore.GREEN}{message}{Style.RESET_ALL}")
-    
-    def print_warning(self, message: str):
-        """Print warning messages in strong yellow"""
-        print(f"{Fore.YELLOW}{message}{Style.RESET_ALL}")
-    
-    def print_error(self, message: str):
-        """Print error messages in red"""
-        print(f"{Fore.RED}{message}{Style.RESET_ALL}")
     
     def _validate_inputs(self):
         """Validate user inputs and arguments"""
@@ -174,16 +142,16 @@ class PhotoChronos:
         """Validate that input paths exist and are accessible"""
         for path in self.args.path:
             if not path.exists():
-                self.print_error(f"Path does not exist: {path}")
+                self.ui.print_error(f"Path does not exist: {path}")
                 sys.exit(1)
             if not path.is_dir():
-                self.print_error(f"Path is not a directory: {path}")
+                self.ui.print_error(f"Path is not a directory: {path}")
                 sys.exit(1)
             try:
                 # Test read access
                 list(path.iterdir())
             except PermissionError:
-                self.print_error(f"Permission denied accessing: {path}")
+                self.ui.print_error(f"Permission denied accessing: {path}")
                 sys.exit(1)
     
     def _validate_extensions(self):
@@ -192,20 +160,20 @@ class PhotoChronos:
             # Remove leading dot if present and convert to lowercase
             clean_ext = ext.lower().lstrip('.')
             if not clean_ext.isalnum():
-                self.print_warning(f"Extension '{ext}' contains special characters - this may cause issues")
+                self.ui.print_warning(f"Extension '{ext}' contains special characters - this may cause issues")
     
     def _validate_output_directory(self):
         """Validate output directory if specified"""
         if self.args.output_dir:
             parent_dir = self.args.output_dir.parent
             if not parent_dir.exists():
-                self.print_error(f"Output directory parent does not exist: {parent_dir}")
+                self.ui.print_error(f"Output directory parent does not exist: {parent_dir}")
                 sys.exit(1)
             try:
                 # Test write access by attempting to create the directory
                 self.args.output_dir.mkdir(parents=True, exist_ok=True)
             except PermissionError:
-                self.print_error(f"Permission denied creating output directory: {self.args.output_dir}")
+                self.ui.print_error(f"Permission denied creating output directory: {self.args.output_dir}")
                 sys.exit(1)
 
     def find_media_files(self) -> List[pathlib.Path]:
@@ -213,11 +181,11 @@ class PhotoChronos:
         files = []
         extensions = set(ext.lower() for ext in self.args.extension)
         
-        self.print_progress("Discovering files...")
+        self.ui.print_progress("Discovering files...")
         
         for path_obj in self.args.path:
             if not path_obj.exists():
-                self.print_warning(f"Path does not exist: {path_obj}")
+                self.ui.print_warning(f"Path does not exist: {path_obj}")
                 continue
                 
             # Use pathlib for better cross-platform support
@@ -232,7 +200,7 @@ class PhotoChronos:
     def analyze_files(self, file_paths: List[pathlib.Path]) -> List[FileInfo]:
         """Analyze files and extract metadata using FileAnalyzer"""
         if not file_paths:
-            self.print_error("No files found to process")
+            self.ui.print_error("No files found to process")
             return []
         
         files = []
@@ -337,27 +305,16 @@ class PhotoChronos:
         files_with_issues = [f for f in files if f.issues]
         
         if not files_with_issues:
-            self.print_info("No issues found during analysis")
+            self.ui.print_info("No issues found during analysis")
             return
         
-        print()  # Empty line before issues
-        # Use orange for issue headers
-        print(f"{Fore.LIGHTRED_EX}Issues found with {len(files_with_issues)} files:{Style.RESET_ALL}")
-        
-        # Group issues by type for cleaner display
+        # Use Rich to display issues
         issue_groups = defaultdict(list)
         for file_info in files_with_issues:
             for issue in file_info.issues:
                 issue_groups[issue].append(file_info.original_name)
         
-        for issue, filenames in issue_groups.items():
-            print(f"{Fore.LIGHTRED_EX}  {issue} ({len(filenames)} files):{Style.RESET_ALL}")
-            # Show first few filenames, then "and X more" if too many
-            show_count = min(3, len(filenames))
-            for filename in filenames[:show_count]:
-                print(f"{Fore.LIGHTRED_EX}{Style.DIM}    - {filename}{Style.RESET_ALL}")
-            if len(filenames) > show_count:
-                print(f"{Fore.LIGHTRED_EX}{Style.DIM}    - ... and {len(filenames) - show_count} more{Style.RESET_ALL}")
+        self.ui.show_issues_report(issue_groups, f"Issues found with {len(files_with_issues)} files")
     
     def generate_new_filename(self, file_info: FileInfo) -> str:
         """Generate new filename based on date created.
@@ -518,7 +475,7 @@ class PhotoChronos:
         if not files:
             return {}
         
-        self.print_progress("Planning renames and organization...")
+        self.ui.print_progress("Planning renames and organization...")
         
         # Sort files by date for consistent processing
         sorted_files = sorted(files, key=lambda f: f.date_created)
@@ -565,11 +522,11 @@ class PhotoChronos:
         duplicates = [f for f in files if f.is_duplicate]
         
         if not duplicates:
-            self.print_info("No duplicates found")
+            self.ui.print_info("No duplicates found")
             return
         
         print()  # Empty line before duplicates
-        self.print_warning(f"Found {len(duplicates)} duplicate files (can be safely deleted):")
+        self.ui.print_warning(f"Found {len(duplicates)} duplicate files (can be safely deleted):")
         
         # Group by directory for cleaner display
         by_directory = defaultdict(list)
@@ -577,11 +534,11 @@ class PhotoChronos:
             by_directory[str(file_info.path.parent)].append(file_info)
         
         for directory, files in sorted(by_directory.items()):
-            self.print_warning(f"  Directory: {directory}")
+            self.ui.print_warning(f"  Directory: {directory}")
             for file_info in files:
-                print(f"{Fore.YELLOW}{Style.DIM}    {file_info.original_name} (duplicate of {file_info.duplicate_of.name}){Style.RESET_ALL}")
+                self.ui.console.print(f"    {file_info.original_name} (duplicate of {file_info.duplicate_of.name})", style="yellow dim")
         
-        self.print_info(f"  These {len(duplicates)} files are identical to existing target files and can be safely deleted.")
+        self.ui.print_info(f"  These {len(duplicates)} files are identical to existing target files and can be safely deleted.")
         print()  # Empty line after duplicates
     
     def interactive_device_selection(self, files: List[FileInfo]):
@@ -602,16 +559,16 @@ class PhotoChronos:
         sorted_devices = sorted(devices_found.items(), key=lambda x: x[1], reverse=True)
         
         print()  # Empty line
-        self.print_result("Camera devices found in photos:")
-        self.print_info("(Photos from selected devices will be kept in regular folders)")
+        self.ui.console.print("Camera devices found in photos:")
+        self.ui.print_info("(Photos from selected devices will be kept in regular folders)")
         print()
         
         # Display devices with numbers
         for i, (device, count) in enumerate(sorted_devices, 1):
-            self.print_result(f"  [{i}] {device} ({count} photos)")
+            self.ui.console.print(f"  [{i}] {device} ({count} photos)")
         
         print()
-        self.print_config("Select family devices by entering numbers (e.g., '1 3 5') or press Enter to skip:")
+        self.ui.console.print("Select family devices by entering numbers (e.g., '1 3 5') or press Enter to skip:")
         
         try:
             response = input("> ").strip()
@@ -632,10 +589,10 @@ class PhotoChronos:
                     FAMILY_DEVICES['user_selected'] = selected_devices
                     
                     # Re-run external photo detection with new devices
-                    self.print_success(f"\nAdded {len(selected_devices)} device(s) as family devices")
-                    self.print_tip("Tip: Use --family-devices next time with these values:")
+                    self.ui.print_success(f"\nAdded {len(selected_devices)} device(s) as family devices")
+                    self.ui.console.print("Tip: Use --family-devices next time with these values:")
                     for device in selected_devices:
-                        self.print_tip(f'  "{device}"')
+                        self.ui.console.print(f'  "{device}"')
                     
                     # Re-detect external photos
                     for file_info in files:
@@ -654,7 +611,7 @@ class PhotoChronos:
             return  # Don't show anything if no external photos
         
         print()  # Empty line before report
-        self.print_result(f"External photos detected: {len(external_photos)} files")
+        self.ui.console.print(f"External photos detected: {len(external_photos)} files")
         
         # Group by reason for cleaner display
         reason_groups = defaultdict(list)
@@ -663,16 +620,16 @@ class PhotoChronos:
             reason_groups[reason].append(file_info.original_name)
         
         for reason, filenames in sorted(reason_groups.items()):
-            self.print_result(f"  {reason} ({len(filenames)} files):")
+            self.ui.console.print(f"  {reason} ({len(filenames)} files):")
             # Show first few filenames
             show_count = min(3, len(filenames))
             for filename in filenames[:show_count]:
-                print(f"{Fore.WHITE}{Style.DIM}    - {filename}{Style.RESET_ALL}")
+                self.ui.console.print(f"    - {filename}", style="white dim")
             if len(filenames) > show_count:
-                print(f"{Fore.WHITE}{Style.DIM}    - ... and {len(filenames) - show_count} more{Style.RESET_ALL}")
+                self.ui.console.print(f"    - ... and {len(filenames) - show_count} more", style="white dim")
         
         if self.args.organize:
-            self.print_info("  These files will be organized into 'extern' folders")
+            self.ui.print_info("  These files will be organized into 'extern' folders")
         print()  # Empty line after report
     
     def show_analysis_summary(self, files: List[FileInfo], duplicates_count: int):
@@ -685,10 +642,10 @@ class PhotoChronos:
         print()  # Empty line before summary
         
         if files_with_issues:
-            self.print_warning(f"{len(files_with_issues)} files had analysis issues (see details above)")
+            self.ui.print_warning(f"{len(files_with_issues)} files had analysis issues (see details above)")
         
         if duplicates_count > 0:
-            self.print_warning(f"{duplicates_count} duplicate files found (see details above)")
+            self.ui.print_warning(f"{duplicates_count} duplicate files found (see details above)")
     
     def prompt_operations_confirmation(self, planned_operations: Dict[str, FileInfo]) -> bool:
         """Confirm planned operations before execution"""
@@ -696,7 +653,7 @@ class PhotoChronos:
             return True
         
         print()  # Empty line before prompt
-        self.print_result(f"{len(planned_operations)} files ready to process")
+        self.ui.console.print(f"{len(planned_operations)} files ready to process")
         
         try:
             response = input("\nProceed with these operations? [y/N]: ").strip().lower()
@@ -713,7 +670,7 @@ class PhotoChronos:
         operation_verb = "copy" if self.args.copy else "move"
         operation_type = OperationType.COPY if self.args.copy else OperationType.MOVE
         
-        self.print_progress(f"{operation_verb.capitalize()}ing files to their destinations...")
+        self.ui.print_progress(f"{operation_verb.capitalize()}ing files to their destinations...")
         
         # Convert FileInfo objects to FileOperation objects
         file_mappings = {file_info.path: file_info.target_path for file_info in planned_operations.values()}
@@ -744,28 +701,18 @@ class PhotoChronos:
         return len(failed_results) == 0
     
     def show_operation_summary(self, success_files: List[str], failed_files: List[Tuple[str, str]], operation_verb: str):
-        """Show summary of file operations"""
-        if success_files:
-            past_tense = "copied" if self.args.copy else "moved"
-            self.print_success(f"Successfully {past_tense} {len(success_files)} files")
-        
-        if failed_files:
-            self.print_error(f"Failed to process {len(failed_files)} files:")
-            # Show first few failures with details
-            show_count = min(5, len(failed_files))
-            for filename, error in failed_files[:show_count]:
-                print(f"{Fore.RED}{Style.DIM}  - {filename}: {error}{Style.RESET_ALL}")
-            if len(failed_files) > show_count:
-                print(f"{Fore.RED}{Style.DIM}  - ... and {len(failed_files) - show_count} more failures{Style.RESET_ALL}")
+        """Show summary of file operations using Rich"""
+        past_tense = "copied" if self.args.copy else "moved"
+        self.ui.show_operation_summary(success_files, failed_files, past_tense)
     
     def show_rename_preview(self, planned_operations: Dict[str, FileInfo]):
         """Show preview of planned operations grouped by target directory"""
         if not planned_operations:
-            self.print_result("No files need processing")
+            self.ui.console.print("No files need processing")
             return
         
         operation_type = "Organization" if self.args.organize else "Rename"
-        self.print_result(f"\n{operation_type} preview ({len(planned_operations)} files):")
+        self.ui.console.print(f"\n{operation_type} preview ({len(planned_operations)} files):")
         
         # Group by target directory for cleaner display
         by_target_directory = defaultdict(list)
@@ -774,52 +721,47 @@ class PhotoChronos:
             by_target_directory[target_dir].append(file_info)
         
         for target_dir, files in sorted(by_target_directory.items()):
-            self.print_result(f"\nTarget: {target_dir}")
+            self.ui.console.print(f"\nTarget: {target_dir}")
             for file_info in files:
                 source = f"{file_info.path.parent.name}/{file_info.original_name}"
                 target = file_info.target_path.name
                 
                 if self.args.organize:
                     # Show full path change for organization
-                    print(f"{Fore.WHITE}{Style.DIM}  {source} → {target}{Style.RESET_ALL}")
+                    self.ui.console.print(f"  {source} → {target}", style="white dim")
                 else:
                     # Show just rename
-                    print(f"{Fore.WHITE}{Style.DIM}  {file_info.original_name} → {target}{Style.RESET_ALL}")
+                    self.ui.console.print(f"  {file_info.original_name} → {target}", style="white dim")
     
     def show_configuration(self):
-        """Show current configuration and what will be processed"""
-        self.print_config("PhotoChronos Configuration:")
-        
-        # Helper to print config line with dim label and colored value
-        def print_config_line(label: str, value: str):
-            print(f"{Fore.CYAN}{Style.DIM}  {label}: {Style.RESET_ALL}{Fore.CYAN}{value}{Style.RESET_ALL}")
-        
-        print_config_line("Paths", ', '.join(str(p) for p in self.args.path))
-        print_config_line("Recursive", 'Yes' if self.args.recursive else 'No')
-        print_config_line("Extensions", ', '.join(sorted(self.args.extension)))
-        print_config_line("Dry run", 'Yes' if self.args.dry_run else 'No')
-        print_config_line("Organize into folders", 'Yes' if self.args.organize else 'No')
+        """Show current configuration using Rich"""
+        config = {
+            "Paths": ', '.join(str(p) for p in self.args.path),
+            "Recursive": 'Yes' if self.args.recursive else 'No',
+            "Extensions": ', '.join(sorted(self.args.extension)),
+            "Dry run": 'Yes' if self.args.dry_run else 'No',
+            "Organize into folders": 'Yes' if self.args.organize else 'No',
+            "Operation mode": 'Copy' if self.args.copy else 'Move'
+        }
         
         if self.args.output_dir:
-            print_config_line("Output directory", str(self.args.output_dir))
-        
-        print_config_line("Operation mode", 'Copy' if self.args.copy else 'Move')
+            config["Output directory"] = str(self.args.output_dir)
         
         if self.args.organize:
-            print_config_line("External photo detection", "Enabled")
+            config["External photo detection"] = "Enabled"
         
         if self.args.family_devices:
-            print_config_line("Additional family devices", ', '.join(self.args.family_devices))
+            config["Additional family devices"] = ', '.join(self.args.family_devices)
         
         if not WINDOWS_METADATA:
-            print_config_line("Video metadata", "Limited (Windows COM not available)")
+            config["Video metadata"] = "Limited (Windows COM not available)"
         
         # Show cache stats if there are cached hashes
         cache_stats = self.duplicate_detector.get_cache_stats()
         if cache_stats['cached_files'] > 0:
-            print_config_line("Hash cache", f"{cache_stats['cached_files']} files ({cache_stats['algorithm']})")
+            config["Hash cache"] = f"{cache_stats['cached_files']} files ({cache_stats['algorithm']})"
         
-        print()  # Empty line after config
+        self.ui.show_configuration(config, "PhotoChronos Configuration")
 
 def main():
     """Main entry point"""
@@ -890,19 +832,19 @@ def main():
     file_paths = app.find_media_files()
     
     if not file_paths:
-        app.print_result("No media files found in specified directories")
+        app.ui.console.print("No media files found in specified directories")
         return 0
     
-    app.print_success(f"Found {len(file_paths)} media files to process")
+    app.ui.print_success(f"Found {len(file_paths)} media files to process")
     
     # Analyze files for metadata
     files = app.analyze_files(file_paths)
     
     if not files:
-        app.print_error("No files could be analyzed")
+        app.ui.print_error("No files could be analyzed")
         return 1
     
-    app.print_success(f"Successfully analyzed {len(files)} files")
+    app.ui.print_success(f"Successfully analyzed {len(files)} files")
     
     # First step: Show issues and reports
     app.show_issues_report(files)
@@ -929,28 +871,28 @@ def main():
     app.show_rename_preview(planned_operations)
     
     if args.dry_run:
-        app.print_info("\nDry run mode - no files were modified")
+        app.ui.print_info("\nDry run mode - no files were modified")
         return 0
     
     if not planned_operations and duplicates_count == 0:
-        app.print_success("All files are already in correct locations with correct names")
+        app.ui.print_success("All files are already in correct locations with correct names")
         return 0
     
     # Get user confirmation before proceeding
     if not app.prompt_operations_confirmation(planned_operations):
-        app.print_info("Operation cancelled by user")
+        app.ui.print_info("Operation cancelled by user")
         return 0
     
     # Execute the operations
     success = app.execute_operations(planned_operations)
     
     if success:
-        app.print_success("File organization completed successfully!")
+        app.ui.print_success("File organization completed successfully!")
         if duplicates_count > 0:
-            app.print_tip(f"\nRemember to manually clean up the {duplicates_count} duplicate files shown above")
+            app.ui.console.print(f"\nRemember to manually clean up the {duplicates_count} duplicate files shown above")
         return 0
     else:
-        app.print_error("Some operations failed - check error messages above")
+        app.ui.print_error("Some operations failed - check error messages above")
         return 1
     
     return 0
