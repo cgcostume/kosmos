@@ -14,9 +14,11 @@ A modern photo and video organization tool that renames files based on their cre
 
 - **Date-based renaming** - Files renamed to `YYYYMMDD_HHMMSS.ext` format
 - **EXIF/metadata extraction** - Reads creation dates from image EXIF and video metadata
+- **Timezone/DST validation** - Proper handling of UTC metadata and DST transitions using zoneinfo
 - **Smart folder organization** - Optional year/year-month structure (e.g., `2024/2024-12/`)
 - **External photo detection** - Automatically identifies photos from non-family sources (WhatsApp, downloads, etc.) and organizes them into separate "extern" folders
-- **Intelligent conflict resolution** - Handles naming conflicts with hash-based duplicate detection
+- **Duplicate detection & deletion** - Hash-based duplicate detection with interactive deletion option
+- **Intelligent conflict resolution** - Handles naming conflicts with comprehensive duplicate analysis
 - **Cross-platform support** - Works with local drives and network shares
 - **Interactive confirmation** - Preview changes before execution
 - **Modern CLI** - Rich-based interface with color-coded output, tables, and comprehensive error handling
@@ -45,6 +47,9 @@ python photochronos.py /path/to/photos --organize --copy -o /backup/photos
 
 # External photo detection with custom family devices
 python photochronos.py /path/to/photos --organize --family-devices "Pixel 7" "OnePlus 9"
+
+# Delete duplicate files with confirmation
+python photochronos.py /path/to/photos --delete-duplicates
 ```
 
 #### Options
@@ -56,6 +61,7 @@ python photochronos.py /path/to/photos --organize --family-devices "Pixel 7" "On
 - `-e, --extension` - File extensions to process (default: all supported formats)
 - `--copy` - Copy files instead of moving them (leaves originals intact)
 - `--family-devices` - Additional family device patterns to recognize (e.g., "Pixel 7")
+- `--delete-duplicates` - Delete duplicate files with interactive confirmation
 
 #### External Photo Detection
 
@@ -100,9 +106,10 @@ Added 3 device(s) as family devices
 
 ## Requirements
 
-- Python 3.12+
-- Windows: Full video metadata support
+- Python 3.9+ (3.12+ recommended)
+- Windows: Full video metadata support via COM
 - Cross-platform: Basic functionality available
+- Dependencies: Rich, ExifRead, tzlocal
 
 ## Setup
 
