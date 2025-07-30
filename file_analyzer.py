@@ -167,16 +167,19 @@ class FileAnalyzer:
                 else:
                     naive_date = date_created
                 
-                # Validate against file system dates - if metadata date is significantly 
-                # newer than file modified date, prefer the file system date
+                # Validate against file system dates
                 file_modified = result.date_modified
                 file_created = result.date_created
                 
-                # If metadata date is more than 1 day newer than file modified date,
-                # it's likely incorrect (file was copied after creation)
+                # Check for DST/timezone issues (exactly 1 hour difference)
+                time_diff_seconds = abs((naive_date - file_modified).total_seconds())
+                if time_diff_seconds == 3600:  # Exactly 1 hour difference
+                    result.issues.append(f"Video metadata has DST/timezone issue (1h diff), using file system date")
+                    return file_modified
+                
+                # Check if metadata date is significantly newer (file was copied after creation)
                 if naive_date > file_modified + datetime.timedelta(days=1):
                     result.issues.append(f"Video metadata date ({naive_date.strftime('%Y-%m-%d')}) newer than file modified date ({file_modified.strftime('%Y-%m-%d')}), using file system date")
-                    # Use the earlier of creation or modification time
                     return min(file_created, file_modified)
                 
                 return naive_date

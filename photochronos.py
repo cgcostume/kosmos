@@ -516,8 +516,12 @@ class PhotoChronos:
                 # Plan operation if file needs to move/rename and isn't a duplicate
                 current_path_str = str(file_info.path)
                 target_path_str = str(target_path)
+                
+                # Only add operation if there's an actual change needed
                 if current_path_str != target_path_str and not file_info.is_duplicate:
-                    planned_operations[current_path_str] = file_info
+                    # Double-check: don't add if only difference is case or whitespace
+                    if file_info.path.name != target_path.name or file_info.path.parent != target_path.parent:
+                        planned_operations[current_path_str] = file_info
                 
                 progress.update(task, advance=1)
         
@@ -952,6 +956,11 @@ def main():
             # Prompt user for confirmation before deleting
             if app.prompt_duplicate_deletion(files):
                 deleted_success, deleted_errors = app.delete_duplicates(files)
+                # Mark successfully deleted files as no longer duplicates for summary
+                if deleted_success > 0:
+                    for file_info in files:
+                        if file_info.is_duplicate and not file_info.path.exists():
+                            file_info.is_duplicate = False
             else:
                 app.ui.print_info("Duplicate deletion cancelled by user")
     
