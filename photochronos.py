@@ -522,6 +522,32 @@ class PhotoChronos:
         
         return planned_operations
     
+    def count_unnecessary_suffixes(self, planned_operations: Dict[str, FileInfo]) -> int:
+        """Count files that got unnecessary _XX suffixes due to naming conflicts"""
+        if not planned_operations:
+            return 0
+        
+        # Get all target filenames that will exist after the operations
+        final_target_names = set()
+        for file_info in planned_operations.values():
+            if file_info.target_path:
+                final_target_names.add(file_info.target_path.name)
+        
+        # Count files with suffixes that could use the unsuffixed name
+        unnecessary_suffixes = 0
+        for file_info in planned_operations.values():
+            if file_info.target_path and '_' in file_info.target_path.name:
+                # Check if this filename has a suffix like _01, _02, etc.
+                name_parts = file_info.target_path.stem.split('_')
+                if len(name_parts) >= 2 and name_parts[-1].isdigit() and len(name_parts[-1]) == 2:
+                    # This file has a numeric suffix
+                    # Check if the unsuffixed version would be available in the final state
+                    base_name = '_'.join(name_parts[:-1]) + file_info.target_path.suffix
+                    if base_name not in final_target_names:
+                        unnecessary_suffixes += 1
+        
+        return unnecessary_suffixes
+    
     def show_duplicates(self, files: List[FileInfo]):
         """Show files that are duplicates and can be safely deleted"""
         duplicates = [f for f in files if f.is_duplicate]
@@ -873,6 +899,15 @@ def main():
     
     # Show operation preview
     app.show_rename_preview(planned_operations)
+    
+    # Check for unnecessary suffixes and warn if found
+    unnecessary_suffixes = app.count_unnecessary_suffixes(planned_operations)
+    if unnecessary_suffixes > 0:
+        print()  # Empty line before warning
+        app.ui.print_warning(f"Naming conflicts detected!")
+        app.ui.console.print(f"{unnecessary_suffixes} files received unnecessary _01 suffixes due to timestamp conflicts.", style="yellow dim")
+        app.ui.console.print("Recommendation: Run the command again after this operation completes.", style="yellow dim")
+        app.ui.console.print("The second run will clean up these naming conflicts.", style="yellow dim")
     
     if args.dry_run:
         app.ui.print_info("\nDry run mode - no files were modified")
