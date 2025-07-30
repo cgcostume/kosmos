@@ -221,7 +221,7 @@ class PhotoChronos:
                         path=file_path,
                         original_name=file_path.name,
                         file_size=analysis_result.file_size,
-                        date_created=analysis_result.date_created.replace(tzinfo=None),  # Make naive for consistency
+                        date_created=analysis_result.date_created,  # Already naive from FileAnalyzer
                         file_type=file_type
                     )
                     
@@ -521,6 +521,48 @@ class PhotoChronos:
                 progress.update(task, advance=1)
         
         return planned_operations
+    
+    def prompt_duplicate_deletion(self, files: List[FileInfo]) -> bool:
+        """Prompt user to confirm duplicate deletion"""
+        duplicates = [f for f in files if f.is_duplicate]
+        
+        if not duplicates:
+            return False
+        
+        print()  # Empty line before prompt
+        self.ui.print_warning(f"Found {len(duplicates)} duplicate files that can be safely deleted.")
+        
+        try:
+            response = input(f"\nDelete these {len(duplicates)} duplicate files? [y/N]: ").strip().lower()
+            return response in ['y', 'yes']
+        except (EOFError, KeyboardInterrupt):
+            return False
+    
+    def delete_duplicates(self, files: List[FileInfo]) -> tuple[int, int]:
+        """Delete duplicate files and return (success_count, error_count)"""
+        duplicates = [f for f in files if f.is_duplicate]
+        
+        if not duplicates:
+            return 0, 0
+        
+        success_count = 0
+        error_count = 0
+        
+        # Create Rich progress bar for deletion
+        with self.ui.create_progress() as progress:
+            task = progress.add_task("Deleting duplicates...", total=len(duplicates))
+            
+            for file_info in duplicates:
+                try:
+                    file_info.path.unlink()  # Delete the file
+                    success_count += 1
+                except Exception as e:
+                    self.ui.print_error(f"Failed to delete {file_info.path.name}: {e}")
+                    error_count += 1
+                
+                progress.update(task, advance=1)
+        
+        return success_count, error_count
     
     def count_unnecessary_suffixes(self, planned_operations: Dict[str, FileInfo]) -> int:
         """Count files that got unnecessary _XX suffixes due to naming conflicts"""
@@ -849,6 +891,12 @@ def main():
         help='Additional family device patterns to recognize (e.g., "Pixel 7" "OnePlus")'
     )
     
+    parser.add_argument(
+        '--delete-duplicates',
+        action='store_true', 
+        help='Delete duplicate files (files identical to others being processed)'
+    )
+    
     args = parser.parse_args()
     
     # Initialize PhotoChronos
@@ -891,7 +939,22 @@ def main():
     # Now show duplicates that were found during planning
     app.show_duplicates(files)
     
-    # Count duplicates for summary
+    # Delete duplicates if requested
+    deleted_success = 0
+    deleted_errors = 0
+    if args.delete_duplicates:
+        if args.dry_run:
+            duplicates_count = sum(1 for f in files if f.is_duplicate)
+            if duplicates_count > 0:
+                app.ui.print_info(f"Would delete {duplicates_count} duplicate files (dry run mode)")
+        else:
+            # Prompt user for confirmation before deleting
+            if app.prompt_duplicate_deletion(files):
+                deleted_success, deleted_errors = app.delete_duplicates(files)
+            else:
+                app.ui.print_info("Duplicate deletion cancelled by user")
+    
+    # Count duplicates for summary (after potential deletion)
     duplicates_count = sum(1 for f in files if f.is_duplicate)
     
     # Show brief summary of issues
@@ -927,8 +990,18 @@ def main():
     
     if success:
         app.ui.print_success("File organization completed successfully!")
-        if duplicates_count > 0:
+        
+        # Show deletion summary
+        if deleted_success > 0:
+            app.ui.print_success(f"Deleted {deleted_success} duplicate files")
+        if deleted_errors > 0:
+            app.ui.print_error(f"Failed to delete {deleted_errors} duplicate files")
+        
+        # Remind about remaining duplicates
+        if duplicates_count > 0 and not args.delete_duplicates:
             app.ui.console.print(f"\nRemember to manually clean up the {duplicates_count} duplicate files shown above")
+            app.ui.console.print("Or use --delete-duplicates to remove them automatically", style="dim")
+        
         return 0
     else:
         app.ui.print_error("Some operations failed - check error messages above")

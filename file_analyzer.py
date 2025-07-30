@@ -56,12 +56,12 @@ class FileAnalyzer:
         try:
             stat = file_path.stat()
             
-            # Create base result with file system info
+            # Create base result with file system info (naive datetime objects)
             result = FileAnalysisResult(
                 path=file_path,
                 file_size=stat.st_size,
-                date_created=datetime.datetime.fromtimestamp(stat.st_ctime, self.timezone),
-                date_modified=datetime.datetime.fromtimestamp(stat.st_mtime, self.timezone)
+                date_created=datetime.datetime.fromtimestamp(stat.st_ctime),
+                date_modified=datetime.datetime.fromtimestamp(stat.st_mtime)
             )
             
             # Try to extract better creation date from metadata
@@ -85,8 +85,8 @@ class FileAnalyzer:
             return FileAnalysisResult(
                 path=file_path,
                 file_size=0,
-                date_created=datetime.datetime.now(self.timezone),
-                date_modified=datetime.datetime.now(self.timezone),
+                date_created=datetime.datetime.now(),
+                date_modified=datetime.datetime.now(),
                 issues=[f"Analysis failed: {e}"]
             )
     
@@ -137,7 +137,7 @@ class FileAnalyzer:
                     if tag_name in tags:
                         try:
                             date_str = str(tags[tag_name])
-                            return datetime.datetime.strptime(date_str, "%Y:%m:%d %H:%M:%S").replace(tzinfo=self.timezone)
+                            return datetime.datetime.strptime(date_str, "%Y:%m:%d %H:%M:%S")
                         except ValueError as e:
                             result.issues.append(f"Invalid date format in {tag_name}: {e}")
                             continue
@@ -161,8 +161,11 @@ class FileAnalyzer:
             date_created = properties.GetValue(pscon.PKEY_Media_DateEncoded).GetValue()
             
             if isinstance(date_created, datetime.datetime):
-                # Convert to local timezone
-                local_date = date_created.astimezone(self.timezone)
+                # Convert to naive datetime (remove timezone info to avoid conversion issues)
+                if date_created.tzinfo is not None:
+                    naive_date = date_created.replace(tzinfo=None)
+                else:
+                    naive_date = date_created
                 
                 # Validate against file system dates - if metadata date is significantly 
                 # newer than file modified date, prefer the file system date
@@ -171,12 +174,12 @@ class FileAnalyzer:
                 
                 # If metadata date is more than 1 day newer than file modified date,
                 # it's likely incorrect (file was copied after creation)
-                if local_date > file_modified + datetime.timedelta(days=1):
-                    result.issues.append(f"Video metadata date ({local_date.strftime('%Y-%m-%d')}) newer than file modified date ({file_modified.strftime('%Y-%m-%d')}), using file system date")
+                if naive_date > file_modified + datetime.timedelta(days=1):
+                    result.issues.append(f"Video metadata date ({naive_date.strftime('%Y-%m-%d')}) newer than file modified date ({file_modified.strftime('%Y-%m-%d')}), using file system date")
                     # Use the earlier of creation or modification time
                     return min(file_created, file_modified)
                 
-                return local_date
+                return naive_date
                 
         except Exception as e:
             result.issues.append(f"Could not read video metadata: {e}")
