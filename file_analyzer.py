@@ -171,11 +171,25 @@ class FileAnalyzer:
                 file_modified = result.date_modified
                 file_created = result.date_created
                 
-                # Check for DST/timezone issues (exactly 1 hour difference)
+                # Check for DST/timezone issues (approximately 1 hour difference)
                 time_diff_seconds = abs((naive_date - file_modified).total_seconds())
-                if time_diff_seconds == 3600:  # Exactly 1 hour difference
-                    result.issues.append(f"Video metadata has DST/timezone issue (1h diff), using file system date")
+                if 3590 <= time_diff_seconds <= 3610:  # ~1 hour difference (allow ±10 seconds)
+                    result.issues.append(f"Video metadata has DST/timezone issue (~1h diff), using file system date")
                     return file_modified
+                
+                # Additional DST check: Try to parse expected time from filename and compare
+                try:
+                    filename_stem = file_path.stem
+                    if len(filename_stem) >= 15 and filename_stem[:8].isdigit() and filename_stem[9:15].isdigit():
+                        expected_time = datetime.datetime.strptime(filename_stem[:15], "%Y%m%d_%H%M%S")
+                        filename_diff_seconds = abs((naive_date - expected_time).total_seconds())
+                        if 3590 <= filename_diff_seconds <= 3610:  # ~1 hour difference from expected filename time
+                            # Use filename time + 1 hour to correct for DST
+                            corrected_time = expected_time
+                            result.issues.append(f"Video metadata has DST issue vs filename (~1h diff), using filename time")
+                            return corrected_time
+                except (ValueError, IndexError):
+                    pass  # Filename not in expected format
                 
                 # Check if metadata date is significantly newer (file was copied after creation)
                 if naive_date > file_modified + datetime.timedelta(days=1):
