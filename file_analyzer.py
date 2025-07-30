@@ -16,6 +16,9 @@ from dataclasses import dataclass
 import exifread
 from tzlocal import get_localzone
 
+# DST validation
+from dst_validator import is_valid_dst_difference
+
 # Windows-specific imports for video metadata
 try:
     from win32com.propsys import propsys, pscon
@@ -171,23 +174,21 @@ class FileAnalyzer:
                 file_modified = result.date_modified
                 file_created = result.date_created
                 
-                # Check for DST/timezone issues (approximately 1 hour difference)
-                time_diff_seconds = abs((naive_date - file_modified).total_seconds())
-                if 3590 <= time_diff_seconds <= 3610:  # ~1 hour difference (allow ±10 seconds)
-                    result.issues.append(f"Video metadata has DST/timezone issue (~1h diff), using file system date")
+                # Check against file system date for timezone issues
+                is_valid_fs, explanation_fs = is_valid_dst_difference(naive_date, file_modified)
+                if is_valid_fs:
+                    result.issues.append(f"Video metadata timezone issue: {explanation_fs}, using file system date")
                     return file_modified
                 
-                # Additional DST check: Try to parse expected time from filename and compare
+                # Check against filename time if parseable
                 try:
                     filename_stem = file_path.stem
                     if len(filename_stem) >= 15 and filename_stem[:8].isdigit() and filename_stem[9:15].isdigit():
                         expected_time = datetime.datetime.strptime(filename_stem[:15], "%Y%m%d_%H%M%S")
-                        filename_diff_seconds = abs((naive_date - expected_time).total_seconds())
-                        if 3590 <= filename_diff_seconds <= 3610:  # ~1 hour difference from expected filename time
-                            # Use filename time + 1 hour to correct for DST
-                            corrected_time = expected_time
-                            result.issues.append(f"Video metadata has DST issue vs filename (~1h diff), using filename time")
-                            return corrected_time
+                        is_valid_fn, explanation_fn = is_valid_dst_difference(naive_date, expected_time)
+                        if is_valid_fn:
+                            result.issues.append(f"Video metadata timezone issue: {explanation_fn}, using filename time")
+                            return expected_time
                 except (ValueError, IndexError):
                     pass  # Filename not in expected format
                 
