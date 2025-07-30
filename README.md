@@ -15,10 +15,12 @@ A modern photo and video organization tool that renames files based on their cre
 - **Date-based renaming** - Files renamed to `YYYYMMDD_HHMMSS.ext` format
 - **EXIF/metadata extraction** - Reads creation dates from image EXIF and video metadata
 - **Smart folder organization** - Optional year/year-month structure (e.g., `2024/2024-12/`)
+- **External photo detection** - Automatically identifies photos from non-family sources (WhatsApp, downloads, etc.) and organizes them into separate "extern" folders
 - **Intelligent conflict resolution** - Handles naming conflicts with hash-based duplicate detection
 - **Cross-platform support** - Works with local drives and network shares
 - **Interactive confirmation** - Preview changes before execution
 - **Professional CLI** - Color-coded output, progress bars, comprehensive error handling
+- **Copy mode** - Option to copy files instead of moving them
 
 #### Usage
 
@@ -37,6 +39,12 @@ python photochronos.py /path/to/photos --organize -o /organized/photos -d
 
 # Process specific file types only
 python photochronos.py /path/to/photos -e jpg png mp4 -r -d
+
+# Copy files instead of moving them
+python photochronos.py /path/to/photos --organize --copy -o /backup/photos
+
+# External photo detection with custom family devices
+python photochronos.py /path/to/photos --organize --family-devices "Pixel 7" "OnePlus 9"
 ```
 
 #### Options
@@ -46,6 +54,43 @@ python photochronos.py /path/to/photos -e jpg png mp4 -r -d
 - `--organize` - Organize files into year/year-month folder structure
 - `-o, --output-dir` - Base directory for organized output
 - `-e, --extension` - File extensions to process (default: all supported formats)
+- `--copy` - Copy files instead of moving them (leaves originals intact)
+- `--family-devices` - Additional family device patterns to recognize (e.g., "Pixel 7")
+
+#### External Photo Detection
+
+When using the `--organize` flag, PhotoChronos automatically detects photos from external sources (not taken by family members) and organizes them into separate folders with an "extern" suffix (e.g., `2024/2024-12 extern/`).
+
+**Detection Methods:**
+1. **Camera Model Check** - Identifies known family devices (iPhones, Samsung Galaxy, common cameras)
+2. **Messaging App Detection** - Recognizes photos from WhatsApp, Signal, Telegram, etc.
+3. **EXIF Completeness** - Photos with minimal metadata are flagged as likely downloaded/shared
+
+**Customization:**
+- **Interactive Mode**: When using `--organize` without `--family-devices`, PhotoChronos will show all detected camera models and let you interactively select which belong to family members
+- Use `--family-devices` to add your specific device models and skip interactive selection
+- Pre-configured for common Apple, Samsung, and camera brands
+- Edit `FAMILY_DEVICES` in the source code for permanent customization
+
+**Interactive Device Selection Example:**
+```
+Camera devices found in photos:
+(Photos from selected devices will be kept in regular folders)
+
+  [1] Apple iPhone 14 Pro (523 photos)
+  [2] Samsung Galaxy S24 (312 photos)
+  [3] Canon EOS R5 (89 photos)
+  [4] Unknown Device (45 photos)
+
+Select family devices by entering numbers (e.g., '1 3 5') or press Enter to skip:
+> 1 2 3
+
+Added 3 device(s) as family devices
+Tip: Use --family-devices next time with these values:
+  "Apple iPhone 14 Pro"
+  "Samsung Galaxy S24"
+  "Canon EOS R5"
+```
 
 #### Supported Formats
 

@@ -51,6 +51,27 @@ except ImportError:
 HASH_CHUNK_SIZE = 4096
 COUNTER_FORMAT = "02d"
 
+# Family device configuration - customize these for your family's devices
+FAMILY_DEVICES = {
+    # Apple devices
+    'apple': ['iPhone', 'iPad', 'iPod'],
+    # Samsung devices
+    'samsung': ['Galaxy', 'SM-', 'GT-'],
+    # Other common family camera brands
+    'cameras': ['Canon', 'Nikon', 'Sony', 'Fujifilm', 'Olympus', 'Panasonic']
+}
+
+# Known messaging app signatures in EXIF software field
+MESSAGING_APP_SIGNATURES = [
+    'whatsapp', 'signal', 'telegram', 'facebook', 'messenger',
+    'instagram', 'snapchat', 'twitter', 'wechat', 'line'
+]
+
+# Minimum EXIF tags expected in original photos
+EXPECTED_EXIF_TAGS = [
+    'Make', 'Model', 'DateTimeOriginal', 'ExifImageWidth', 'ExifImageHeight'
+]
+
 # File type definitions
 IMAGE_EXTENSIONS = {'jpg', 'jpeg', 'png', 'tiff', 'tif', 'bmp', 'gif', 'webp', 'srw', 'raw', 'cr2', 'nef', 'arw'}
 VIDEO_EXTENSIONS = {'mp4', 'mov', 'avi', 'mkv', 'wmv', 'flv', 'webm', 'm4v', '3gp'}
@@ -70,6 +91,12 @@ class FileInfo:
     is_duplicate: bool = False
     duplicate_of: Optional[pathlib.Path] = None
     issues: List[str] = None
+    is_external: bool = False  # True if photo is from external source (not family camera)
+    external_reason: Optional[str] = None  # Reason why marked as external
+    camera_make: Optional[str] = None
+    camera_model: Optional[str] = None
+    software: Optional[str] = None
+    exif_completeness: float = 0.0  # Score 0-1 indicating EXIF data completeness
     
     def __post_init__(self):
         if self.issues is None:
@@ -84,6 +111,10 @@ class PhotoChronos:
         self.duplicates: Dict[str, List[FileInfo]] = defaultdict(list)
         self.issues: List[str] = []
         
+        # Extend family devices with user-provided patterns
+        if args.family_devices:
+            FAMILY_DEVICES['user_defined'] = args.family_devices
+        
         # Validate inputs during initialization
         self._validate_inputs()
         
@@ -94,6 +125,14 @@ class PhotoChronos:
     def print_config(self, message: str):
         """Print configuration info in light cyan"""
         print(f"{Fore.CYAN}{message}{Style.RESET_ALL}")
+    
+    def print_info(self, message: str):
+        """Print neutral information in dim white (gray)"""
+        print(f"{Fore.WHITE}{Style.DIM}{message}{Style.RESET_ALL}")
+    
+    def print_tip(self, message: str):
+        """Print tips and hints in magenta"""
+        print(f"{Fore.MAGENTA}{message}{Style.RESET_ALL}")
     
     def print_progress(self, message: str):
         """Print intermediate/progress messages in dim white"""
@@ -177,7 +216,7 @@ class PhotoChronos:
         return files
 
     def extract_date_from_image(self, file_path: pathlib.Path, file_info: FileInfo) -> Optional[datetime.datetime]:
-        """Extract creation date from image EXIF data"""
+        """Extract creation date and camera info from image EXIF data"""
         date_tags = [
             'EXIF DateTimeOriginal', 'DateTimeOriginal',
             'EXIF DateTimeDigitized', 'DateTimeDigitized', 
@@ -188,6 +227,19 @@ class PhotoChronos:
             with open(file_path, 'rb') as file:
                 tags = exifread.process_file(file, details=False)
                 
+                # Extract camera make and model
+                if 'Image Make' in tags:
+                    file_info.camera_make = str(tags['Image Make']).strip()
+                if 'Image Model' in tags:
+                    file_info.camera_model = str(tags['Image Model']).strip()
+                if 'Image Software' in tags:
+                    file_info.software = str(tags['Image Software']).strip()
+                
+                # Count available EXIF tags for completeness check
+                available_tags = sum(1 for tag in EXPECTED_EXIF_TAGS if any(tag in str(k) for k in tags.keys()))
+                file_info.exif_completeness = available_tags / len(EXPECTED_EXIF_TAGS)
+                
+                # Extract date
                 for tag in date_tags:
                     if tag in tags:
                         date_str = str(tags[tag])
@@ -254,7 +306,7 @@ class PhotoChronos:
             return []
         
         files = []
-        pbar = tqdm(total=len(file_paths), desc="Analyzing dates", unit="files", leave=True)
+        pbar = tqdm(total=len(file_paths), desc="Analyzing files", unit="files", leave=True)
         
         for file_path in file_paths:
             try:
@@ -272,6 +324,9 @@ class PhotoChronos:
                 
                 # Get actual date (this may add issues to file_info)
                 file_info.date_created = self.get_file_date(file_path, file_info)
+                
+                # Detect if photo is from external source
+                self.detect_external_photo(file_info)
                 
                 files.append(file_info)
                 
@@ -292,12 +347,53 @@ class PhotoChronos:
         pbar.close()
         return files
     
+    def detect_external_photo(self, file_info: FileInfo):
+        """Detect if photo is from external source using hybrid approach"""
+        # Only check images for now (videos have limited metadata)
+        if file_info.file_type != 'image':
+            return
+        
+        # Check 1: Camera model against family device list
+        if file_info.camera_make and file_info.camera_model:
+            is_family_device = False
+            
+            # Check each family device category
+            for category, patterns in FAMILY_DEVICES.items():
+                for pattern in patterns:
+                    if (pattern.lower() in file_info.camera_make.lower() or 
+                        pattern.lower() in file_info.camera_model.lower()):
+                        is_family_device = True
+                        break
+                if is_family_device:
+                    break
+            
+            if not is_family_device:
+                file_info.is_external = True
+                file_info.external_reason = f"Unknown device: {file_info.camera_make} {file_info.camera_model}"
+                return
+        
+        # Check 2: Software field for messaging app signatures
+        if file_info.software:
+            software_lower = file_info.software.lower()
+            for app in MESSAGING_APP_SIGNATURES:
+                if app in software_lower:
+                    file_info.is_external = True
+                    file_info.external_reason = f"Messaging app detected: {app}"
+                    return
+        
+        # Check 3: EXIF completeness (no camera info = likely external)
+        if not file_info.camera_make and not file_info.camera_model:
+            if file_info.exif_completeness < 0.4:  # Less than 40% of expected tags
+                file_info.is_external = True
+                file_info.external_reason = "Minimal EXIF data (likely downloaded/shared)"
+                return
+    
     def show_issues_report(self, files: List[FileInfo]):
         """Show summary of issues encountered during analysis"""
         files_with_issues = [f for f in files if f.issues]
         
         if not files_with_issues:
-            self.print_config("No issues found during analysis")
+            self.print_info("No issues found during analysis")
             return
         
         print()  # Empty line before issues
@@ -315,9 +411,9 @@ class PhotoChronos:
             # Show first few filenames, then "and X more" if too many
             show_count = min(3, len(filenames))
             for filename in filenames[:show_count]:
-                print(f"{Fore.LIGHTRED_EX}    - {filename}{Style.RESET_ALL}")
+                print(f"{Fore.LIGHTRED_EX}{Style.DIM}    - {filename}{Style.RESET_ALL}")
             if len(filenames) > show_count:
-                print(f"{Fore.LIGHTRED_EX}    - ... and {len(filenames) - show_count} more{Style.RESET_ALL}")
+                print(f"{Fore.LIGHTRED_EX}{Style.DIM}    - ... and {len(filenames) - show_count} more{Style.RESET_ALL}")
     
     def generate_new_filename(self, file_info: FileInfo) -> str:
         """Generate new filename based on date created.
@@ -362,6 +458,10 @@ class PhotoChronos:
         date = file_info.date_created
         year = date.strftime("%Y")
         year_month = date.strftime("%Y-%m")
+        
+        # Add "extern" suffix for external photos
+        if file_info.is_external:
+            year_month = f"{year_month} extern"
         
         # Determine base directory
         if self.args.output_dir:
@@ -487,7 +587,7 @@ class PhotoChronos:
         duplicates = [f for f in files if f.is_duplicate]
         
         if not duplicates:
-            self.print_config("No duplicates found")
+            self.print_info("No duplicates found")
             return
         
         print()  # Empty line before duplicates
@@ -499,45 +599,126 @@ class PhotoChronos:
             by_directory[str(file_info.path.parent)].append(file_info)
         
         for directory, files in sorted(by_directory.items()):
-            self.print_config(f"  Directory: {directory}")
+            self.print_warning(f"  Directory: {directory}")
             for file_info in files:
-                self.print_warning(f"    {file_info.original_name} (duplicate of {file_info.duplicate_of.name})")
+                print(f"{Fore.YELLOW}{Style.DIM}    {file_info.original_name} (duplicate of {file_info.duplicate_of.name}){Style.RESET_ALL}")
         
-        self.print_config(f"  These {len(duplicates)} files are identical to existing target files and can be safely deleted.")
+        self.print_info(f"  These {len(duplicates)} files are identical to existing target files and can be safely deleted.")
         print()  # Empty line after duplicates
     
-    def prompt_issues_confirmation(self, files: List[FileInfo], duplicates_count: int) -> bool:
-        """First confirmation: Acknowledge issues and duplicates"""
+    def interactive_device_selection(self, files: List[FileInfo]):
+        """Allow user to interactively select family devices from detected cameras"""
+        # Collect all unique camera devices found
+        devices_found = {}
+        for file_info in files:
+            if file_info.camera_make and file_info.camera_model:
+                device_key = f"{file_info.camera_make} {file_info.camera_model}".strip()
+                if device_key not in devices_found:
+                    devices_found[device_key] = 0
+                devices_found[device_key] += 1
+        
+        if not devices_found:
+            return  # No devices to select from
+        
+        # Sort by count (most common first)
+        sorted_devices = sorted(devices_found.items(), key=lambda x: x[1], reverse=True)
+        
+        print()  # Empty line
+        self.print_result("Camera devices found in photos:")
+        self.print_info("(Photos from selected devices will be kept in regular folders)")
+        print()
+        
+        # Display devices with numbers
+        for i, (device, count) in enumerate(sorted_devices, 1):
+            self.print_result(f"  [{i}] {device} ({count} photos)")
+        
+        print()
+        self.print_config("Select family devices by entering numbers (e.g., '1 3 5') or press Enter to skip:")
+        
+        try:
+            response = input("> ").strip()
+            if response:
+                # Parse selected numbers
+                selected_indices = []
+                for num_str in response.split():
+                    try:
+                        num = int(num_str)
+                        if 1 <= num <= len(sorted_devices):
+                            selected_indices.append(num - 1)
+                    except ValueError:
+                        continue
+                
+                if selected_indices:
+                    # Add selected devices to family devices
+                    selected_devices = [sorted_devices[i][0] for i in selected_indices]
+                    FAMILY_DEVICES['user_selected'] = selected_devices
+                    
+                    # Re-run external photo detection with new devices
+                    self.print_success(f"\nAdded {len(selected_devices)} device(s) as family devices")
+                    self.print_tip("Tip: Use --family-devices next time with these values:")
+                    for device in selected_devices:
+                        self.print_tip(f'  "{device}"')
+                    
+                    # Re-detect external photos
+                    for file_info in files:
+                        file_info.is_external = False
+                        file_info.external_reason = None
+                        self.detect_external_photo(file_info)
+        
+        except KeyboardInterrupt:
+            print("\nDevice selection cancelled")
+    
+    def show_external_photos_report(self, files: List[FileInfo]):
+        """Show summary of external photos detected"""
+        external_photos = [f for f in files if f.is_external]
+        
+        if not external_photos:
+            return  # Don't show anything if no external photos
+        
+        print()  # Empty line before report
+        self.print_result(f"External photos detected: {len(external_photos)} files")
+        
+        # Group by reason for cleaner display
+        reason_groups = defaultdict(list)
+        for file_info in external_photos:
+            reason = file_info.external_reason or "Unknown reason"
+            reason_groups[reason].append(file_info.original_name)
+        
+        for reason, filenames in sorted(reason_groups.items()):
+            self.print_result(f"  {reason} ({len(filenames)} files):")
+            # Show first few filenames
+            show_count = min(3, len(filenames))
+            for filename in filenames[:show_count]:
+                print(f"{Fore.WHITE}{Style.DIM}    - {filename}{Style.RESET_ALL}")
+            if len(filenames) > show_count:
+                print(f"{Fore.WHITE}{Style.DIM}    - ... and {len(filenames) - show_count} more{Style.RESET_ALL}")
+        
+        if self.args.organize:
+            self.print_info("  These files will be organized into 'extern' folders")
+        print()  # Empty line after report
+    
+    def show_analysis_summary(self, files: List[FileInfo], duplicates_count: int):
+        """Show brief summary of issues and duplicates"""
         files_with_issues = [f for f in files if f.issues]
         
         if not files_with_issues and duplicates_count == 0:
-            return True
+            return
         
-        print()  # Empty line before prompt
+        print()  # Empty line before summary
         
         if files_with_issues:
-            self.print_config(f"{len(files_with_issues)} files had analysis issues (shown above)")
+            self.print_warning(f"{len(files_with_issues)} files had analysis issues (see details above)")
         
         if duplicates_count > 0:
-            self.print_config(f"{duplicates_count} duplicate files found (will be left for manual cleanup)")
-        
-        if not files_with_issues and not duplicates_count:
-            return True
-            
-        try:
-            response = input("\nContinue despite these issues? [y/N]: ").strip().lower()
-            return response in ['y', 'yes']
-        except KeyboardInterrupt:
-            print("\nOperation cancelled by user")
-            return False
+            self.print_warning(f"{duplicates_count} duplicate files found (see details above)")
     
     def prompt_operations_confirmation(self, planned_operations: Dict[str, FileInfo]) -> bool:
-        """Second confirmation: Confirm planned operations"""
+        """Confirm planned operations before execution"""
         if not planned_operations:
             return True
         
         print()  # Empty line before prompt
-        self.print_result(f"Ready to process {len(planned_operations)} files")
+        self.print_result(f"{len(planned_operations)} files ready to process")
         
         try:
             response = input("\nProceed with these operations? [y/N]: ").strip().lower()
@@ -551,8 +732,8 @@ class PhotoChronos:
         if not planned_operations:
             return True
         
-        operation_verb = "Copying" if self.args.copy else "Moving"
-        self.print_progress(f"{operation_verb} files...")
+        operation_verb = "copy" if self.args.copy else "move"
+        self.print_progress(f"{operation_verb.capitalize()}ing files to their destinations...")
         
         # Create progress bar for operations
         pbar = tqdm(total=len(planned_operations), desc="Processing files", unit="files", leave=True)
@@ -598,16 +779,17 @@ class PhotoChronos:
     def show_operation_summary(self, success_files: List[str], failed_files: List[Tuple[str, str]], operation_verb: str):
         """Show summary of file operations"""
         if success_files:
-            self.print_success(f"Successfully {operation_verb} {len(success_files)} files")
+            past_tense = "copied" if self.args.copy else "moved"
+            self.print_success(f"Successfully {past_tense} {len(success_files)} files")
         
         if failed_files:
             self.print_error(f"Failed to process {len(failed_files)} files:")
             # Show first few failures with details
             show_count = min(5, len(failed_files))
             for filename, error in failed_files[:show_count]:
-                self.print_config(f"  - {filename}: {error}")
+                print(f"{Fore.RED}{Style.DIM}  - {filename}: {error}{Style.RESET_ALL}")
             if len(failed_files) > show_count:
-                self.print_config(f"  - ... and {len(failed_files) - show_count} more failures")
+                print(f"{Fore.RED}{Style.DIM}  - ... and {len(failed_files) - show_count} more failures{Style.RESET_ALL}")
     
     def show_rename_preview(self, planned_operations: Dict[str, FileInfo]):
         """Show preview of planned operations grouped by target directory"""
@@ -615,8 +797,8 @@ class PhotoChronos:
             self.print_result("No files need processing")
             return
         
-        operation_type = "organization" if self.args.organize else "renames"
-        self.print_result(f"\nPlanned {operation_type} ({len(planned_operations)} files):")
+        operation_type = "Organization" if self.args.organize else "Rename"
+        self.print_result(f"\n{operation_type} preview ({len(planned_operations)} files):")
         
         # Group by target directory for cleaner display
         by_target_directory = defaultdict(list)
@@ -625,31 +807,46 @@ class PhotoChronos:
             by_target_directory[target_dir].append(file_info)
         
         for target_dir, files in sorted(by_target_directory.items()):
-            self.print_config(f"\nTarget: {target_dir}")
+            self.print_result(f"\nTarget: {target_dir}")
             for file_info in files:
                 source = f"{file_info.path.parent.name}/{file_info.original_name}"
                 target = file_info.target_path.name
                 
                 if self.args.organize:
                     # Show full path change for organization
-                    self.print_result(f"  {source} → {target}")
+                    print(f"{Fore.WHITE}{Style.DIM}  {source} → {target}{Style.RESET_ALL}")
                 else:
                     # Show just rename
-                    self.print_result(f"  {file_info.original_name} → {target}")
+                    print(f"{Fore.WHITE}{Style.DIM}  {file_info.original_name} → {target}{Style.RESET_ALL}")
     
     def show_configuration(self):
         """Show current configuration and what will be processed"""
         self.print_config("PhotoChronos Configuration:")
-        self.print_config(f"  Paths: {', '.join(str(p) for p in self.args.path)}")
-        self.print_config(f"  Recursive: {'Yes' if self.args.recursive else 'No'}")
-        self.print_config(f"  Extensions: {', '.join(sorted(self.args.extension))}")
-        self.print_config(f"  Dry run: {'Yes' if self.args.dry_run else 'No'}")
-        self.print_config(f"  Organize into folders: {'Yes' if self.args.organize else 'No'}")
+        
+        # Helper to print config line with dim label and colored value
+        def print_config_line(label: str, value: str):
+            print(f"{Fore.CYAN}{Style.DIM}  {label}: {Style.RESET_ALL}{Fore.CYAN}{value}{Style.RESET_ALL}")
+        
+        print_config_line("Paths", ', '.join(str(p) for p in self.args.path))
+        print_config_line("Recursive", 'Yes' if self.args.recursive else 'No')
+        print_config_line("Extensions", ', '.join(sorted(self.args.extension)))
+        print_config_line("Dry run", 'Yes' if self.args.dry_run else 'No')
+        print_config_line("Organize into folders", 'Yes' if self.args.organize else 'No')
+        
         if self.args.output_dir:
-            self.print_config(f"  Output directory: {self.args.output_dir}")
-        self.print_config(f"  Operation mode: {'Copy' if self.args.copy else 'Move'}")
+            print_config_line("Output directory", str(self.args.output_dir))
+        
+        print_config_line("Operation mode", 'Copy' if self.args.copy else 'Move')
+        
+        if self.args.organize:
+            print_config_line("External photo detection", "Enabled")
+        
+        if self.args.family_devices:
+            print_config_line("Additional family devices", ', '.join(self.args.family_devices))
+        
         if not WINDOWS_METADATA:
-            self.print_config("  Video metadata: Limited (Windows COM not available)")
+            print_config_line("Video metadata", "Limited (Windows COM not available)")
+        
         print()  # Empty line after config
 
 def main():
@@ -703,6 +900,12 @@ def main():
         help='Copy files instead of moving them (leaves originals intact)'
     )
     
+    parser.add_argument(
+        '--family-devices',
+        nargs='+',
+        help='Additional family device patterns to recognize (e.g., "Pixel 7" "OnePlus")'
+    )
+    
     args = parser.parse_args()
     
     # Initialize PhotoChronos
@@ -718,7 +921,7 @@ def main():
         app.print_result("No media files found in specified directories")
         return 0
     
-    app.print_success(f"Found {len(file_paths)} media files")
+    app.print_success(f"Found {len(file_paths)} media files to process")
     
     # Analyze files for metadata
     files = app.analyze_files(file_paths)
@@ -729,35 +932,39 @@ def main():
     
     app.print_success(f"Successfully analyzed {len(files)} files")
     
-    # Plan operations (renames and/or organization)
-    planned_operations = app.plan_renames(files)
-    
     # First confirmation step: Show issues and duplicates
     app.show_issues_report(files)
     app.show_duplicates(files)
     
-    # Count duplicates for confirmation prompt
+    # Interactive device selection if organizing and no custom devices provided
+    if args.organize and not args.family_devices:
+        app.interactive_device_selection(files)
+    
+    app.show_external_photos_report(files)
+    
+    # Count duplicates
     duplicates_count = sum(1 for f in files if f.is_duplicate)
     
-    # First confirmation: Acknowledge issues and duplicates
-    if not app.prompt_issues_confirmation(files, duplicates_count):
-        app.print_config("Operation cancelled by user")
-        return 0
+    # Show brief summary of issues
+    app.show_analysis_summary(files, duplicates_count)
     
-    # Second confirmation step: Show operation preview
+    # Plan operations (renames and/or organization) - AFTER device selection
+    planned_operations = app.plan_renames(files)
+    
+    # Show operation preview
     app.show_rename_preview(planned_operations)
     
     if args.dry_run:
-        app.print_config("\nDry run mode - no files were modified")
+        app.print_info("\nDry run mode - no files were modified")
         return 0
     
     if not planned_operations and duplicates_count == 0:
         app.print_success("All files are already in correct locations with correct names")
         return 0
     
-    # Second confirmation: Confirm operations
+    # Get user confirmation before proceeding
     if not app.prompt_operations_confirmation(planned_operations):
-        app.print_config("Operation cancelled by user")
+        app.print_info("Operation cancelled by user")
         return 0
     
     # Execute the operations
@@ -766,7 +973,7 @@ def main():
     if success:
         app.print_success("File organization completed successfully!")
         if duplicates_count > 0:
-            app.print_config(f"\nRemember to manually clean up the {duplicates_count} duplicate files shown above")
+            app.print_tip(f"\nRemember to manually clean up the {duplicates_count} duplicate files shown above")
         return 0
     else:
         app.print_error("Some operations failed - check error messages above")
