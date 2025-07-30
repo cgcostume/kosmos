@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+"""
+Generic File Analysis Module
+
+Provides metadata extraction capabilities for various file types including
+images and videos. Extracts creation dates, EXIF data, and other file properties.
+"""
+
+import pathlib
+import datetime
+import sys
+from typing import Optional, List, Dict, Any
+from dataclasses import dataclass
+
+# Third-party imports
+import exifread
+from tzlocal import get_localzone
+
+# Windows-specific imports for video metadata
+try:
+    from win32com.propsys import propsys, pscon
+    WINDOWS_METADATA = True
+except ImportError:
+    WINDOWS_METADATA = False
+
+
+@dataclass
+class FileAnalysisResult:
+    """Result of file analysis containing metadata and extracted information"""
+    path: pathlib.Path
+    file_size: int
+    date_created: datetime.datetime
+    date_modified: datetime.datetime
+    has_exif: bool = False
+    camera_make: Optional[str] = None
+    camera_model: Optional[str] = None
+    issues: List[str] = None
+    raw_metadata: Dict[str, Any] = None
+    
+    def __post_init__(self):
+        if self.issues is None:
+            self.issues = []
+        if self.raw_metadata is None:
+            self.raw_metadata = {}
+
+
+class FileAnalyzer:
+    """Generic file analyzer for extracting metadata from various file types"""
+    
+    def __init__(self, timezone=None):
+        """Initialize analyzer with optional timezone"""
+        self.timezone = timezone or get_localzone()
+    
+    def analyze_file(self, file_path: pathlib.Path) -> FileAnalysisResult:
+        """Analyze a single file and extract all available metadata"""
+        try:
+            stat = file_path.stat()
+            
+            # Create base result with file system info
+            result = FileAnalysisResult(
+                path=file_path,
+                file_size=stat.st_size,
+                date_created=datetime.datetime.fromtimestamp(stat.st_ctime, self.timezone),
+                date_modified=datetime.datetime.fromtimestamp(stat.st_mtime, self.timezone)
+            )
+            
+            # Try to extract better creation date from metadata
+            creation_date = self._extract_creation_date(file_path, result)
+            if creation_date:
+                result.date_created = creation_date
+            
+            return result
+            
+        except Exception as e:
+            # Return minimal result with error
+            return FileAnalysisResult(
+                path=file_path,
+                file_size=0,
+                date_created=datetime.datetime.now(self.timezone),
+                date_modified=datetime.datetime.now(self.timezone),
+                issues=[f"Analysis failed: {e}"]
+            )
+    
+    def analyze_files(self, file_paths: List[pathlib.Path]) -> List[FileAnalysisResult]:
+        """Analyze multiple files and return results"""
+        return [self.analyze_file(path) for path in file_paths]
+    
+    def _extract_creation_date(self, file_path: pathlib.Path, result: FileAnalysisResult) -> Optional[datetime.datetime]:
+        """Extract creation date from file metadata"""
+        # Try image metadata first
+        if self._is_image_file(file_path):
+            date = self._extract_date_from_image(file_path, result)
+            if date:
+                return date
+        
+        # Try video metadata
+        if self._is_video_file(file_path):
+            date = self._extract_date_from_video(file_path, result)
+            if date:
+                return date
+        
+        return None
+    
+    def _extract_date_from_image(self, file_path: pathlib.Path, result: FileAnalysisResult) -> Optional[datetime.datetime]:
+        """Extract creation date from image EXIF data"""
+        try:
+            with open(file_path, 'rb') as f:
+                tags = exifread.process_file(f, stop_tag='DateTime')
+                
+                if tags:
+                    result.has_exif = True
+                    result.raw_metadata.update({str(k): str(v) for k, v in tags.items()})
+                    
+                    # Extract camera info
+                    if 'Image Make' in tags:
+                        result.camera_make = str(tags['Image Make']).strip()
+                    if 'Image Model' in tags:
+                        result.camera_model = str(tags['Image Model']).strip()
+                
+                # Try multiple date fields in order of preference
+                date_tags = [
+                    'EXIF DateTimeOriginal',
+                    'EXIF DateTime', 
+                    'Image DateTime'
+                ]
+                
+                for tag_name in date_tags:
+                    if tag_name in tags:
+                        try:
+                            date_str = str(tags[tag_name])
+                            return datetime.datetime.strptime(date_str, "%Y:%m:%d %H:%M:%S").replace(tzinfo=self.timezone)
+                        except ValueError as e:
+                            result.issues.append(f"Invalid date format in {tag_name}: {e}")
+                            continue
+                
+        except Exception as e:
+            result.issues.append(f"EXIF extraction failed: {e}")
+        
+        return None
+    
+    def _extract_date_from_video(self, file_path: pathlib.Path, result: FileAnalysisResult) -> Optional[datetime.datetime]:
+        """Extract creation date from video metadata"""
+        if not WINDOWS_METADATA:
+            result.issues.append("Video metadata not available (Windows COM required)")
+            return None
+        
+        try:
+            # Windows-specific video metadata extraction
+            from win32com.propsys import propsys, pscon
+            
+            properties = propsys.SHGetPropertyStoreFromParsingName(str(file_path.absolute()))
+            date_created = properties.GetValue(pscon.PKEY_Media_DateEncoded).GetValue()
+            
+            if isinstance(date_created, datetime.datetime):
+                # Convert to local timezone and return with timezone info
+                local_date = date_created.astimezone(self.timezone)
+                return local_date
+                
+        except Exception as e:
+            result.issues.append(f"Could not read video metadata: {e}")
+        
+        return None
+    
+    def _is_image_file(self, file_path: pathlib.Path) -> bool:
+        """Check if file is an image based on extension"""
+        image_extensions = {
+            'jpg', 'jpeg', 'png', 'gif', 'bmp', 'tiff', 'tif', 
+            'raw', 'cr2', 'nef', 'arw', 'srw', 'webp'
+        }
+        return file_path.suffix.lower().lstrip('.') in image_extensions
+    
+    def _is_video_file(self, file_path: pathlib.Path) -> bool:
+        """Check if file is a video based on extension"""
+        video_extensions = {
+            'mp4', 'avi', 'mov', 'mkv', 'wmv', 'flv', 
+            'webm', 'm4v', '3gp'
+        }
+        return file_path.suffix.lower().lstrip('.') in video_extensions

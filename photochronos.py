@@ -29,10 +29,11 @@ import exifread
 from tzlocal import get_localzone
 import colorama
 from colorama import Fore, Style, Back
-import shutil
 
 # Local imports
 from duplicate_detector import DuplicateDetector
+from file_analyzer import FileAnalyzer, FileAnalysisResult
+from file_operations import FileOperations, OperationType
 
 # Initialize colorama for cross-platform color support
 colorama.init()
@@ -117,6 +118,12 @@ class PhotoChronos:
             hash_algorithm='md5',
             chunk_size=65536
         )
+        
+        # Initialize file analyzer
+        self.file_analyzer = FileAnalyzer()
+        
+        # Initialize file operations
+        self.file_operations = FileOperations()
         
         # Extend family devices with user-provided patterns
         if args.family_devices:
@@ -222,92 +229,8 @@ class PhotoChronos:
         
         return files
 
-    def extract_date_from_image(self, file_path: pathlib.Path, file_info: FileInfo) -> Optional[datetime.datetime]:
-        """Extract creation date and camera info from image EXIF data"""
-        date_tags = [
-            'EXIF DateTimeOriginal', 'DateTimeOriginal',
-            'EXIF DateTimeDigitized', 'DateTimeDigitized', 
-            'EXIF DateTime', 'DateTime'
-        ]
-        
-        try:
-            with open(file_path, 'rb') as file:
-                tags = exifread.process_file(file, details=False)
-                
-                # Extract camera make and model
-                if 'Image Make' in tags:
-                    file_info.camera_make = str(tags['Image Make']).strip()
-                if 'Image Model' in tags:
-                    file_info.camera_model = str(tags['Image Model']).strip()
-                if 'Image Software' in tags:
-                    file_info.software = str(tags['Image Software']).strip()
-                
-                # Count available EXIF tags for completeness check
-                available_tags = sum(1 for tag in EXPECTED_EXIF_TAGS if any(tag in str(k) for k in tags.keys()))
-                file_info.exif_completeness = available_tags / len(EXPECTED_EXIF_TAGS)
-                
-                # Extract date
-                for tag in date_tags:
-                    if tag in tags:
-                        date_str = str(tags[tag])
-                        try:
-                            return datetime.datetime.strptime(date_str, '%Y:%m:%d %H:%M:%S')
-                        except ValueError:
-                            continue
-                            
-        except Exception as e:
-            file_info.issues.append(f"Could not read EXIF data: {e}")
-        
-        if not file_info.issues:
-            file_info.issues.append("No EXIF date found")
-        
-        return None
-
-    def extract_date_from_video(self, file_path: pathlib.Path, file_info: FileInfo) -> Optional[datetime.datetime]:
-        """Extract creation date from video metadata (Windows only)"""
-        if not WINDOWS_METADATA:
-            file_info.issues.append("Video metadata not available (Windows COM required)")
-            return None
-            
-        try:
-            properties = propsys.SHGetPropertyStoreFromParsingName(str(file_path.absolute()))
-            date_created = properties.GetValue(pscon.PKEY_Media_DateEncoded).GetValue()
-            
-            if isinstance(date_created, datetime.datetime):
-                # Convert to local timezone and make naive for consistency
-                local_date = date_created.astimezone(get_localzone())
-                return local_date.replace(tzinfo=None)
-                
-        except Exception as e:
-            file_info.issues.append(f"Could not read video metadata: {e}")
-        
-        if not file_info.issues:
-            file_info.issues.append("No video metadata found")
-        
-        return None
-
-    def get_file_date(self, file_path: pathlib.Path, file_info: FileInfo) -> datetime.datetime:
-        """Get the creation date of a file, trying multiple methods"""
-        file_ext = file_path.suffix.lower().lstrip('.')
-        
-        # Try EXIF for images
-        if file_ext in IMAGE_EXTENSIONS:
-            exif_date = self.extract_date_from_image(file_path, file_info)
-            if exif_date:
-                return exif_date
-        
-        # Try video metadata for videos
-        elif file_ext in VIDEO_EXTENSIONS:
-            video_date = self.extract_date_from_video(file_path, file_info)
-            if video_date:
-                return video_date
-        
-        # Fallback to file modification time
-        file_info.issues.append("Using file modification time (no metadata found)")
-        return datetime.datetime.fromtimestamp(file_path.stat().st_mtime)
-
     def analyze_files(self, file_paths: List[pathlib.Path]) -> List[FileInfo]:
-        """Analyze files and extract metadata"""
+        """Analyze files and extract metadata using FileAnalyzer"""
         if not file_paths:
             self.print_error("No files found to process")
             return []
@@ -317,20 +240,34 @@ class PhotoChronos:
         
         for file_path in file_paths:
             try:
+                # Use FileAnalyzer to get metadata
+                analysis_result = self.file_analyzer.analyze_file(file_path)
+                
+                # Convert FileAnalysisResult to FileInfo
                 file_ext = file_path.suffix.lower().lstrip('.')
                 file_type = 'image' if file_ext in IMAGE_EXTENSIONS else 'video'
                 
-                # Create file_info first, then get date (which may add issues)
                 file_info = FileInfo(
                     path=file_path,
                     original_name=file_path.name,
-                    file_size=file_path.stat().st_size,
-                    date_created=datetime.datetime.now(),  # Temporary, will be updated
+                    file_size=analysis_result.file_size,
+                    date_created=analysis_result.date_created.replace(tzinfo=None),  # Make naive for consistency
                     file_type=file_type
                 )
                 
-                # Get actual date (this may add issues to file_info)
-                file_info.date_created = self.get_file_date(file_path, file_info)
+                # Copy over metadata from analysis
+                file_info.camera_make = analysis_result.camera_make
+                file_info.camera_model = analysis_result.camera_model
+                file_info.issues.extend(analysis_result.issues)
+                
+                # Calculate EXIF completeness for external photo detection
+                if analysis_result.has_exif and analysis_result.raw_metadata:
+                    available_tags = sum(1 for tag in EXPECTED_EXIF_TAGS if any(tag in str(k) for k in analysis_result.raw_metadata.keys()))
+                    file_info.exif_completeness = available_tags / len(EXPECTED_EXIF_TAGS)
+                
+                # Extract software info if available
+                if analysis_result.raw_metadata and 'Image Software' in analysis_result.raw_metadata:
+                    file_info.software = str(analysis_result.raw_metadata['Image Software']).strip()
                 
                 # Detect if photo is from external source
                 self.detect_external_photo(file_info)
@@ -338,7 +275,7 @@ class PhotoChronos:
                 files.append(file_info)
                 
             except Exception as e:
-                # Create a file_info for failed analysis too
+                # Create a file_info for failed analysis
                 file_info = FileInfo(
                     path=file_path,
                     original_name=file_path.name,
@@ -769,53 +706,42 @@ class PhotoChronos:
             return False
     
     def execute_operations(self, planned_operations: Dict[str, FileInfo]) -> bool:
-        """Execute the planned file operations"""
+        """Execute the planned file operations using FileOperations module"""
         if not planned_operations:
             return True
         
         operation_verb = "copy" if self.args.copy else "move"
+        operation_type = OperationType.COPY if self.args.copy else OperationType.MOVE
+        
         self.print_progress(f"{operation_verb.capitalize()}ing files to their destinations...")
         
-        # Create progress bar for operations
-        pbar = tqdm(total=len(planned_operations), desc="Processing files", unit="files", leave=True)
+        # Convert FileInfo objects to FileOperation objects
+        file_mappings = {file_info.path: file_info.target_path for file_info in planned_operations.values()}
+        operations = self.file_operations.plan_batch_operations(file_mappings, operation_type)
         
-        success_files = []
-        failed_files = []
+        # Set up progress callback
+        def progress_callback(message):
+            # This could update a progress bar if needed
+            pass
         
-        for file_info in planned_operations.values():
-            try:
-                # Create target directory if it doesn't exist
-                target_dir = file_info.target_path.parent
-                target_dir.mkdir(parents=True, exist_ok=True)
-                
-                if self.args.copy:
-                    # Copy mode - always copy, never delete original
-                    shutil.copy2(file_info.path, file_info.target_path)
-                else:
-                    # Move mode - try rename first, fallback to copy+delete for cross-drive
-                    try:
-                        file_info.path.rename(file_info.target_path)
-                    except OSError as rename_error:
-                        if "different disk drive" in str(rename_error) or rename_error.errno == 17:
-                            # Cross-drive operation - use copy + delete
-                            shutil.copy2(file_info.path, file_info.target_path)
-                            file_info.path.unlink()  # Delete original after successful copy
-                        else:
-                            raise  # Re-raise if it's a different error
-                
-                success_files.append(file_info.original_name)
-                
-            except Exception as e:
-                failed_files.append((file_info.original_name, str(e)))
-            
-            pbar.update(1)
+        self.file_operations.progress_callback = progress_callback
         
+        # Execute operations with progress bar
+        pbar = tqdm(total=len(operations), desc="Processing files", unit="files", leave=True)
+        
+        successful_results, failed_results = self.file_operations.execute_batch_operations(operations)
+        
+        pbar.update(len(operations))
         pbar.close()
+        
+        # Convert results back to the expected format
+        success_files = [result.operation.identifier for result in successful_results]
+        failed_files = [(result.operation.identifier, result.error_message) for result in failed_results]
         
         # Show operation summary
         self.show_operation_summary(success_files, failed_files, operation_verb.lower())
         
-        return len(failed_files) == 0
+        return len(failed_results) == 0
     
     def show_operation_summary(self, success_files: List[str], failed_files: List[Tuple[str, str]], operation_verb: str):
         """Show summary of file operations"""
