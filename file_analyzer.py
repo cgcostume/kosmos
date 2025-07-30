@@ -68,6 +68,15 @@ class FileAnalyzer:
             creation_date = self._extract_creation_date(file_path, result)
             if creation_date:
                 result.date_created = creation_date
+            else:
+                # If metadata extraction failed, prefer modification date for both images and videos
+                # (creation date gets updated when files are copied/moved)
+                if self._is_image_file(file_path):
+                    result.date_created = result.date_modified
+                    result.issues.append("No image EXIF data available, using file modification date")
+                elif self._is_video_file(file_path):
+                    result.date_created = result.date_modified
+                    result.issues.append("No video metadata available, using file modification date")
             
             return result
             
@@ -139,7 +148,7 @@ class FileAnalyzer:
         return None
     
     def _extract_date_from_video(self, file_path: pathlib.Path, result: FileAnalysisResult) -> Optional[datetime.datetime]:
-        """Extract creation date from video metadata"""
+        """Extract creation date from video metadata with validation against file system dates"""
         if not WINDOWS_METADATA:
             result.issues.append("Video metadata not available (Windows COM required)")
             return None
@@ -152,8 +161,21 @@ class FileAnalyzer:
             date_created = properties.GetValue(pscon.PKEY_Media_DateEncoded).GetValue()
             
             if isinstance(date_created, datetime.datetime):
-                # Convert to local timezone and return with timezone info
+                # Convert to local timezone
                 local_date = date_created.astimezone(self.timezone)
+                
+                # Validate against file system dates - if metadata date is significantly 
+                # newer than file modified date, prefer the file system date
+                file_modified = result.date_modified
+                file_created = result.date_created
+                
+                # If metadata date is more than 1 day newer than file modified date,
+                # it's likely incorrect (file was copied after creation)
+                if local_date > file_modified + datetime.timedelta(days=1):
+                    result.issues.append(f"Video metadata date ({local_date.strftime('%Y-%m-%d')}) newer than file modified date ({file_modified.strftime('%Y-%m-%d')}), using file system date")
+                    # Use the earlier of creation or modification time
+                    return min(file_created, file_modified)
+                
                 return local_date
                 
         except Exception as e:

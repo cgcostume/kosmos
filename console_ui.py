@@ -62,8 +62,9 @@ class ConsoleUI:
     # Configuration display
     def show_configuration(self, config: Dict[str, Any], title: str = "Configuration"):
         """Display configuration in a formatted table"""
-        table = Table(title=title, show_header=False, box=box.SIMPLE)
-        table.add_column("Setting", style="cyan dim", min_width=20)
+        # Create table without title
+        table = Table(show_header=False, box=box.SIMPLE)
+        table.add_column("Setting", style="cyan dim", min_width=20, justify="right")
         table.add_column("Value", style="cyan", min_width=30)
         
         for key, value in config.items():
@@ -72,9 +73,23 @@ class ConsoleUI:
             table.add_row(key, str(value))
         
         self.console.print(table)
-        self.console.print()  # Empty line after config
     
     # Progress bar management
+    def create_progress(self):
+        """Create a Rich progress context manager for batch operations"""
+        from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn, TimeRemainingColumn
+        
+        return Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            TextColumn("({task.completed}/{task.total})"),
+            TimeElapsedColumn(),
+            TimeRemainingColumn(),
+            console=self.console
+        )
+    
     def create_progress_bar(self, description: str = "Processing") -> str:
         """Create a new progress bar and return its ID"""
         if not self._current_progress:

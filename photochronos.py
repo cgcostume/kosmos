@@ -20,11 +20,10 @@ import sys
 import os
 import datetime
 from typing import List, Dict, Tuple, Optional, Set
-from collections import OrderedDict, defaultdict
+from collections import defaultdict
 from dataclasses import dataclass
 
 # Third-party imports
-from tqdm import tqdm
 import exifread
 from tzlocal import get_localzone
 # Local imports
@@ -204,59 +203,61 @@ class PhotoChronos:
             return []
         
         files = []
-        pbar = tqdm(total=len(file_paths), desc="Analyzing files", unit="files", leave=True)
         
-        for file_path in file_paths:
-            try:
-                # Use FileAnalyzer to get metadata
-                analysis_result = self.file_analyzer.analyze_file(file_path)
-                
-                # Convert FileAnalysisResult to FileInfo
-                file_ext = file_path.suffix.lower().lstrip('.')
-                file_type = 'image' if file_ext in IMAGE_EXTENSIONS else 'video'
-                
-                file_info = FileInfo(
-                    path=file_path,
-                    original_name=file_path.name,
-                    file_size=analysis_result.file_size,
-                    date_created=analysis_result.date_created.replace(tzinfo=None),  # Make naive for consistency
-                    file_type=file_type
-                )
-                
-                # Copy over metadata from analysis
-                file_info.camera_make = analysis_result.camera_make
-                file_info.camera_model = analysis_result.camera_model
-                file_info.issues.extend(analysis_result.issues)
-                
-                # Calculate EXIF completeness for external photo detection
-                if analysis_result.has_exif and analysis_result.raw_metadata:
-                    available_tags = sum(1 for tag in EXPECTED_EXIF_TAGS if any(tag in str(k) for k in analysis_result.raw_metadata.keys()))
-                    file_info.exif_completeness = available_tags / len(EXPECTED_EXIF_TAGS)
-                
-                # Extract software info if available
-                if analysis_result.raw_metadata and 'Image Software' in analysis_result.raw_metadata:
-                    file_info.software = str(analysis_result.raw_metadata['Image Software']).strip()
-                
-                # Detect if photo is from external source
-                self.detect_external_photo(file_info)
-                
-                files.append(file_info)
-                
-            except Exception as e:
-                # Create a file_info for failed analysis
-                file_info = FileInfo(
-                    path=file_path,
-                    original_name=file_path.name,
-                    file_size=0,
-                    date_created=datetime.datetime.fromtimestamp(file_path.stat().st_mtime),
-                    file_type='unknown'
-                )
-                file_info.issues.append(f"Analysis failed: {e}")
-                files.append(file_info)
+        # Create Rich progress bar for file analysis
+        with self.ui.create_progress() as progress:
+            task = progress.add_task("Analyzing files...", total=len(file_paths))
             
-            pbar.update(1)
+            for file_path in file_paths:
+                try:
+                    # Use FileAnalyzer to get metadata
+                    analysis_result = self.file_analyzer.analyze_file(file_path)
+                    
+                    # Convert FileAnalysisResult to FileInfo
+                    file_ext = file_path.suffix.lower().lstrip('.')
+                    file_type = 'image' if file_ext in IMAGE_EXTENSIONS else 'video'
+                    
+                    file_info = FileInfo(
+                        path=file_path,
+                        original_name=file_path.name,
+                        file_size=analysis_result.file_size,
+                        date_created=analysis_result.date_created.replace(tzinfo=None),  # Make naive for consistency
+                        file_type=file_type
+                    )
+                    
+                    # Copy over metadata from analysis
+                    file_info.camera_make = analysis_result.camera_make
+                    file_info.camera_model = analysis_result.camera_model
+                    file_info.issues.extend(analysis_result.issues)
+                    
+                    # Calculate EXIF completeness for external photo detection
+                    if analysis_result.has_exif and analysis_result.raw_metadata:
+                        available_tags = sum(1 for tag in EXPECTED_EXIF_TAGS if any(tag in str(k) for k in analysis_result.raw_metadata.keys()))
+                        file_info.exif_completeness = available_tags / len(EXPECTED_EXIF_TAGS)
+                    
+                    # Extract software info if available
+                    if analysis_result.raw_metadata and 'Image Software' in analysis_result.raw_metadata:
+                        file_info.software = str(analysis_result.raw_metadata['Image Software']).strip()
+                    
+                    # Detect if photo is from external source
+                    self.detect_external_photo(file_info)
+                    
+                    files.append(file_info)
+                    
+                except Exception as e:
+                    # Create a file_info for failed analysis
+                    file_info = FileInfo(
+                        path=file_path,
+                        original_name=file_path.name,
+                        file_size=0,
+                        date_created=datetime.datetime.fromtimestamp(file_path.stat().st_mtime),
+                        file_type='unknown'
+                    )
+                    file_info.issues.append(f"Analysis failed: {e}")
+                    files.append(file_info)
+                
+                progress.update(task, advance=1)
         
-        pbar.close()
         return files
     
     def detect_external_photo(self, file_info: FileInfo):
@@ -487,34 +488,38 @@ class PhotoChronos:
         used_target_paths: Set[str] = set()
         planned_operations: Dict[str, FileInfo] = {}
         
-        # Progress bar for planning phase
-        pbar = tqdm(sorted_files, desc="Planning operations", unit="file", leave=False)
-        
-        for file_info in pbar:
-            # Skip duplicates that were already detected in the first pass
-            if file_info.is_duplicate:
-                continue
+        # Create Rich progress bar for planning operations
+        with self.ui.create_progress() as progress:
+            task = progress.add_task("Planning operations...", total=len(sorted_files))
+            
+            for file_info in sorted_files:
+                # Skip duplicates that were already detected in the first pass
+                if file_info.is_duplicate:
+                    progress.update(task, advance=1)
+                    continue
+                    
+                base_new_name = self.generate_new_filename(file_info)
                 
-            base_new_name = self.generate_new_filename(file_info)
-            
-            # Resolve naming conflicts and get final target path
-            final_name, target_path = self._resolve_naming_conflicts(file_info, base_new_name, used_target_paths)
-            
-            # Skip processing if it's a duplicate (empty path returned)
-            if str(target_path) == "." or target_path == pathlib.Path():
-                continue
-            
-            used_target_paths.add(str(target_path))
-            file_info.new_name = final_name
-            file_info.target_path = target_path
-            
-            # Plan operation if file needs to move/rename and isn't a duplicate
-            current_path_str = str(file_info.path)
-            target_path_str = str(target_path)
-            if current_path_str != target_path_str and not file_info.is_duplicate:
-                planned_operations[current_path_str] = file_info
+                # Resolve naming conflicts and get final target path
+                final_name, target_path = self._resolve_naming_conflicts(file_info, base_new_name, used_target_paths)
+                
+                # Skip processing if it's a duplicate (empty path returned)
+                if str(target_path) == "." or target_path == pathlib.Path():
+                    progress.update(task, advance=1)
+                    continue
+                
+                used_target_paths.add(str(target_path))
+                file_info.new_name = final_name
+                file_info.target_path = target_path
+                
+                # Plan operation if file needs to move/rename and isn't a duplicate
+                current_path_str = str(file_info.path)
+                target_path_str = str(target_path)
+                if current_path_str != target_path_str and not file_info.is_duplicate:
+                    planned_operations[current_path_str] = file_info
+                
+                progress.update(task, advance=1)
         
-        pbar.close()
         return planned_operations
     
     def show_duplicates(self, files: List[FileInfo]):
@@ -522,7 +527,6 @@ class PhotoChronos:
         duplicates = [f for f in files if f.is_duplicate]
         
         if not duplicates:
-            self.ui.print_info("No duplicates found")
             return
         
         print()  # Empty line before duplicates
@@ -560,7 +564,7 @@ class PhotoChronos:
         
         print()  # Empty line
         self.ui.console.print("Camera devices found in photos:")
-        self.ui.print_info("(Photos from selected devices will be kept in regular folders)")
+        self.ui.print_info("Photos from family devices go to regular folders, others go to 'extern' folders")
         print()
         
         # Display devices with numbers
@@ -590,9 +594,6 @@ class PhotoChronos:
                     
                     # Re-run external photo detection with new devices
                     self.ui.print_success(f"\nAdded {len(selected_devices)} device(s) as family devices")
-                    self.ui.console.print("Tip: Use --family-devices next time with these values:")
-                    for device in selected_devices:
-                        self.ui.console.print(f'  "{device}"')
                     
                     # Re-detect external photos
                     for file_info in files:
@@ -683,13 +684,15 @@ class PhotoChronos:
         
         self.file_operations.progress_callback = progress_callback
         
-        # Execute operations with progress bar
-        pbar = tqdm(total=len(operations), desc="Processing files", unit="files", leave=True)
-        
-        successful_results, failed_results = self.file_operations.execute_batch_operations(operations)
-        
-        pbar.update(len(operations))
-        pbar.close()
+        # Execute operations with Rich progress bar
+        with self.ui.create_progress() as progress:
+            task = progress.add_task("Processing files...", total=len(operations))
+            
+            def progress_update(message):
+                progress.update(task, advance=1)
+            
+            self.file_operations.progress_callback = progress_update
+            successful_results, failed_results = self.file_operations.execute_batch_operations(operations)
         
         # Convert results back to the expected format
         success_files = [result.operation.identifier for result in successful_results]
@@ -854,6 +857,7 @@ def main():
         app.interactive_device_selection(files)
     
     app.show_external_photos_report(files)
+    
     
     # Plan operations (renames and/or organization) - This detects duplicates
     planned_operations = app.plan_renames(files)

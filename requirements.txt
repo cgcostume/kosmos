@@ -1,5 +1,4 @@
 # Core dependencies for photochronos
-tqdm>=4.66.0
 exifread>=3.0.0
 tzlocal>=5.0.0
 pywin32>=306  # for win32com.propsys (video metadata)

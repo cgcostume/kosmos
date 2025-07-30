@@ -19,7 +19,7 @@ A modern photo and video organization tool that renames files based on their cre
 - **Intelligent conflict resolution** - Handles naming conflicts with hash-based duplicate detection
 - **Cross-platform support** - Works with local drives and network shares
 - **Interactive confirmation** - Preview changes before execution
-- **Professional CLI** - Color-coded output, progress bars, comprehensive error handling
+- **Modern CLI** - Rich-based interface with color-coded output, tables, and comprehensive error handling
 - **Copy mode** - Option to copy files instead of moving them
 
 #### Usage
@@ -75,7 +75,7 @@ When using the `--organize` flag, PhotoChronos automatically detects photos from
 **Interactive Device Selection Example:**
 ```
 Camera devices found in photos:
-(Photos from selected devices will be kept in regular folders)
+Photos from family devices go to regular folders, others go to 'extern' folders
 
   [1] Apple iPhone 14 Pro (523 photos)
   [2] Samsung Galaxy S24 (312 photos)
@@ -86,10 +86,6 @@ Select family devices by entering numbers (e.g., '1 3 5') or press Enter to skip
 > 1 2 3
 
 Added 3 device(s) as family devices
-Tip: Use --family-devices next time with these values:
-  "Apple iPhone 14 Pro"
-  "Samsung Galaxy S24"
-  "Canon EOS R5"
 ```
 
 #### Supported Formats
