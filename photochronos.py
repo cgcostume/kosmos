@@ -430,45 +430,46 @@ class PhotoChronos:
             return new_name, target_path
     
     def _detect_content_duplicates(self, files: List[FileInfo]):
-        """Detect content duplicates across all files and mark them"""
-        # Group files by their target filename (without path) to find potential duplicates
+        """Detect content duplicates efficiently by grouping files with same target names"""
+        # Group files by their target filename (efficient O(n) grouping)
         target_name_groups = defaultdict(list)
         for file_info in files:
             target_name = self.generate_new_filename(file_info)
             target_name_groups[target_name].append(file_info)
         
-        # Check for duplicates within each filename group
+        # Only check duplicates within groups that would conflict (efficient)
         for target_name, file_group in target_name_groups.items():
             if len(file_group) > 1:
-                # Compare each file with the others in the group
+                # Sort by path for consistent ordering
+                file_group.sort(key=lambda f: str(f.path))
+                
+                # Check each file against others in the same target group
                 for i, file1 in enumerate(file_group):
-                    if file1.is_duplicate:  # Already marked as duplicate
+                    if file1.is_duplicate:
                         continue
                     
-                    # Check against all subsequent files in the group
                     for file2 in file_group[i+1:]:
-                        if file2.is_duplicate:  # Already marked as duplicate
+                        if file2.is_duplicate:
                             continue
                         
                         try:
                             if self.duplicate_detector.files_are_identical(file1.path, file2.path):
-                                # Mark the second file as duplicate of the first
+                                # Mark the second file as duplicate (consistent with sort order)
                                 file2.is_duplicate = True
                                 file2.duplicate_of = file1.path
+                                break  # file1 found its duplicate, move to next file1
                         except Exception as e:
                             file2.issues.append(f"Duplicate check failed: {e}")
 
     def _check_for_duplicate(self, file_info: FileInfo, target_path: pathlib.Path) -> bool:
         """Check if file is duplicate and mark it if so. Returns True if duplicate."""
-        try:
-            if self.duplicate_detector.files_are_identical(file_info.path, target_path):
-                file_info.is_duplicate = True
-                file_info.duplicate_of = target_path
-                # For duplicates, we don't set a target_path since they won't be moved
-                return True
-        except Exception as e:
-            # Log error but don't treat as duplicate
-            file_info.issues.append(f"Duplicate check failed: {e}")
+        # If already marked as duplicate by comprehensive check, respect that
+        if file_info.is_duplicate:
+            return True
+        
+        # CRITICAL: Do NOT check duplicates during planning phase
+        # All duplicate detection should happen in _detect_content_duplicates
+        # This prevents symmetric duplicate marking bugs
         return False
     
     def plan_renames(self, files: List[FileInfo]) -> Dict[str, FileInfo]:
