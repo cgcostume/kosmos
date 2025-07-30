@@ -29,8 +29,10 @@ import exifread
 from tzlocal import get_localzone
 import colorama
 from colorama import Fore, Style, Back
-import hashlib
 import shutil
+
+# Local imports
+from duplicate_detector import DuplicateDetector
 
 # Initialize colorama for cross-platform color support
 colorama.init()
@@ -48,7 +50,6 @@ except ImportError:
     WINDOWS_METADATA = False
 
 # Configuration constants
-HASH_CHUNK_SIZE = 4096
 COUNTER_FORMAT = "02d"
 
 # Family device configuration - customize these for your family's devices
@@ -110,6 +111,12 @@ class PhotoChronos:
         self.files: List[FileInfo] = []
         self.duplicates: Dict[str, List[FileInfo]] = defaultdict(list)
         self.issues: List[str] = []
+        
+        # Initialize duplicate detector with in-memory caching
+        self.duplicate_detector = DuplicateDetector(
+            hash_algorithm='md5',
+            chunk_size=65536
+        )
         
         # Extend family devices with user-provided patterns
         if args.family_devices:
@@ -451,8 +458,11 @@ class PhotoChronos:
         new_filename = file_info.new_name or self.generate_new_filename(file_info)
         
         if not self.args.organize:
-            # Keep in same directory
-            return file_info.path.parent / new_filename
+            # Use output directory if specified, otherwise keep in same directory
+            if self.args.output_dir:
+                return self.args.output_dir / new_filename
+            else:
+                return file_info.path.parent / new_filename
         
         # Organize into year/year-month structure (e.g., 2024/2024-12)
         date = file_info.date_created
@@ -480,31 +490,6 @@ class PhotoChronos:
         counter_str = f"{counter:{COUNTER_FORMAT}}"
         return f"{name_part}_{counter_str}.{ext_part}" if ext_part else f"{name_part}_{counter_str}"
     
-    def calculate_file_hash(self, file_path: pathlib.Path) -> str:
-        """Calculate MD5 hash of file for duplicate detection"""
-        hash_md5 = hashlib.md5()
-        try:
-            with open(file_path, 'rb') as f:
-                for chunk in iter(lambda: f.read(HASH_CHUNK_SIZE), b''):
-                    hash_md5.update(chunk)
-            return hash_md5.hexdigest()
-        except Exception as e:
-            self.print_warning(f"Could not calculate hash for {file_path.name}: {e}")
-            return ""
-    
-    def files_are_identical(self, file1: pathlib.Path, file2: pathlib.Path) -> bool:
-        """Check if two files are identical by comparing size and hash"""
-        try:
-            # Quick size check first
-            if file1.stat().st_size != file2.stat().st_size:
-                return False
-            
-            # Then hash check
-            hash1 = self.calculate_file_hash(file1)
-            hash2 = self.calculate_file_hash(file2)
-            return hash1 == hash2 and hash1 != ""
-        except Exception:
-            return False
     
     def _resolve_naming_conflicts(self, file_info: FileInfo, base_new_name: str, used_target_paths: Set[str]) -> tuple[str, pathlib.Path]:
         """Resolve naming conflicts and return final name and target path"""
@@ -518,16 +503,28 @@ class PhotoChronos:
             
             # Check if already used in current batch
             if target_path_str in used_target_paths:
+                # Check if this could be a duplicate by looking for existing file with same name
+                # We need to check if the file might already exist on disk even if not in batch yet
+                if target_path.exists():
+                    duplicate_result = self._check_for_duplicate(file_info, target_path)
+                    if duplicate_result:
+                        return new_name, pathlib.Path()  # It's a duplicate
                 new_name = self._increment_filename(base_new_name, counter)
                 counter += 1
                 continue
             
             # Check if target file already exists on disk
             if target_path.exists():
-                # Check if it's the same file by hash
+                # Check if this is the same file (already in correct location)
+                if file_info.path.resolve() == target_path.resolve():
+                    # Same file, already in correct location - no processing needed
+                    return new_name, target_path
+                
+                # Different source file - check if it's a duplicate by content
                 duplicate_result = self._check_for_duplicate(file_info, target_path)
                 if duplicate_result:
-                    return new_name, target_path  # It's a duplicate
+                    # For duplicates, return empty path to signal no move needed
+                    return new_name, pathlib.Path()  # It's a duplicate
                 else:
                     # Different file with same name - increment and try again
                     new_name = self._increment_filename(base_new_name, counter)
@@ -537,13 +534,46 @@ class PhotoChronos:
             # No conflicts - we can use this target path
             return new_name, target_path
     
+    def _detect_content_duplicates(self, files: List[FileInfo]):
+        """Detect content duplicates across all files and mark them"""
+        # Group files by their target filename (without path) to find potential duplicates
+        target_name_groups = defaultdict(list)
+        for file_info in files:
+            target_name = self.generate_new_filename(file_info)
+            target_name_groups[target_name].append(file_info)
+        
+        # Check for duplicates within each filename group
+        for target_name, file_group in target_name_groups.items():
+            if len(file_group) > 1:
+                # Compare each file with the others in the group
+                for i, file1 in enumerate(file_group):
+                    if file1.is_duplicate:  # Already marked as duplicate
+                        continue
+                    
+                    # Check against all subsequent files in the group
+                    for file2 in file_group[i+1:]:
+                        if file2.is_duplicate:  # Already marked as duplicate
+                            continue
+                        
+                        try:
+                            if self.duplicate_detector.files_are_identical(file1.path, file2.path):
+                                # Mark the second file as duplicate of the first
+                                file2.is_duplicate = True
+                                file2.duplicate_of = file1.path
+                        except Exception as e:
+                            file2.issues.append(f"Duplicate check failed: {e}")
+
     def _check_for_duplicate(self, file_info: FileInfo, target_path: pathlib.Path) -> bool:
         """Check if file is duplicate and mark it if so. Returns True if duplicate."""
-        if self.files_are_identical(file_info.path, target_path):
-            file_info.is_duplicate = True
-            file_info.duplicate_of = target_path
-            file_info.target_path = target_path
-            return True
+        try:
+            if self.duplicate_detector.files_are_identical(file_info.path, target_path):
+                file_info.is_duplicate = True
+                file_info.duplicate_of = target_path
+                # For duplicates, we don't set a target_path since they won't be moved
+                return True
+        except Exception as e:
+            # Log error but don't treat as duplicate
+            file_info.issues.append(f"Duplicate check failed: {e}")
         return False
     
     def plan_renames(self, files: List[FileInfo]) -> Dict[str, FileInfo]:
@@ -556,6 +586,9 @@ class PhotoChronos:
         # Sort files by date for consistent processing
         sorted_files = sorted(files, key=lambda f: f.date_created)
         
+        # First pass: Detect duplicates by content across all files
+        self._detect_content_duplicates(sorted_files)
+        
         # Track used target paths to handle conflicts
         used_target_paths: Set[str] = set()
         planned_operations: Dict[str, FileInfo] = {}
@@ -564,10 +597,18 @@ class PhotoChronos:
         pbar = tqdm(sorted_files, desc="Planning operations", unit="file", leave=False)
         
         for file_info in pbar:
+            # Skip duplicates that were already detected in the first pass
+            if file_info.is_duplicate:
+                continue
+                
             base_new_name = self.generate_new_filename(file_info)
             
             # Resolve naming conflicts and get final target path
             final_name, target_path = self._resolve_naming_conflicts(file_info, base_new_name, used_target_paths)
+            
+            # Skip processing if it's a duplicate (empty path returned)
+            if str(target_path) == "." or target_path == pathlib.Path():
+                continue
             
             used_target_paths.add(str(target_path))
             file_info.new_name = final_name
@@ -847,6 +888,11 @@ class PhotoChronos:
         if not WINDOWS_METADATA:
             print_config_line("Video metadata", "Limited (Windows COM not available)")
         
+        # Show cache stats if there are cached hashes
+        cache_stats = self.duplicate_detector.get_cache_stats()
+        if cache_stats['cached_files'] > 0:
+            print_config_line("Hash cache", f"{cache_stats['cached_files']} files ({cache_stats['algorithm']})")
+        
         print()  # Empty line after config
 
 def main():
@@ -932,9 +978,8 @@ def main():
     
     app.print_success(f"Successfully analyzed {len(files)} files")
     
-    # First confirmation step: Show issues and duplicates
+    # First step: Show issues and reports
     app.show_issues_report(files)
-    app.show_duplicates(files)
     
     # Interactive device selection if organizing and no custom devices provided
     if args.organize and not args.family_devices:
@@ -942,14 +987,17 @@ def main():
     
     app.show_external_photos_report(files)
     
-    # Count duplicates
+    # Plan operations (renames and/or organization) - This detects duplicates
+    planned_operations = app.plan_renames(files)
+    
+    # Now show duplicates that were found during planning
+    app.show_duplicates(files)
+    
+    # Count duplicates for summary
     duplicates_count = sum(1 for f in files if f.is_duplicate)
     
     # Show brief summary of issues
     app.show_analysis_summary(files, duplicates_count)
-    
-    # Plan operations (renames and/or organization) - AFTER device selection
-    planned_operations = app.plan_renames(files)
     
     # Show operation preview
     app.show_rename_preview(planned_operations)
