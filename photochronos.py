@@ -241,9 +241,7 @@ class PhotoChronos:
                     # Calculate EXIF completeness for external photo detection
                     if analysis_result.has_exif and analysis_result.raw_metadata:
                         available_tags = sum(
-                            1
-                            for tag in EXPECTED_EXIF_TAGS
-                            if any(tag in str(k) for k in analysis_result.raw_metadata)
+                            1 for tag in EXPECTED_EXIF_TAGS if any(tag in str(k) for k in analysis_result.raw_metadata)
                         )
                         file_info.exif_completeness = available_tags / len(EXPECTED_EXIF_TAGS)
 
