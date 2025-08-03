@@ -21,7 +21,7 @@ import pathlib
 import sys
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Optional
 
 # Third-party imports
 import exifread
