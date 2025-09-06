@@ -34,3 +34,8 @@ Thumbs.db
 
 # Test files
 test/
+monosis_test/
+
+# Tool caches
+.ruff_cache/
+.claude/
