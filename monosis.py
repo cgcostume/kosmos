@@ -86,7 +86,7 @@ class Monosis:
     def __init__(self, args):
         self.args = args
         self.ui = ConsoleUI()
-        self.duplicate_detector = DuplicateDetector(hash_algorithm="md5")
+        self.duplicate_detector = DuplicateDetector(hash_algorithm="xxhash64")
         self.file_operations = FileOperations()
 
         # Cache configuration
@@ -103,6 +103,9 @@ class Monosis:
 
         # Initialize cache database
         self._init_cache_db()
+
+        # Load existing cache into DuplicateDetector
+        self._load_cache_into_detector()
 
     def _init_cache_db(self):
         """Initialize SQLite cache database"""
@@ -123,6 +126,21 @@ class Monosis:
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_size ON file_hashes(file_size)
             """)
+
+    def _load_cache_into_detector(self):
+        """Load cached hashes into the duplicate detector for faster lookups"""
+        if not self.cache_db.exists():
+            return
+
+        with sqlite3.connect(self.cache_db) as conn:
+            cursor = conn.execute("""
+                SELECT file_path, full_hash FROM file_hashes 
+                WHERE full_hash IS NOT NULL
+            """)
+
+            for file_path, full_hash in cursor:
+                # Load into detector's cache
+                self.duplicate_detector._hash_cache[file_path] = full_hash
 
     def show_configuration(self):
         """Show current configuration"""
@@ -221,7 +239,7 @@ class Monosis:
         return True
 
     def _resolve_network_path(self, path: pathlib.Path) -> Optional[pathlib.Path]:
-        """Resolve network paths and handle Windows UNC paths like \\server\share"""
+        r"""Resolve network paths and handle Windows UNC paths like \\server\share"""
         try:
             path_str = str(path)
 
@@ -343,22 +361,30 @@ class Monosis:
 
     def _locations_list(self):
         """List configured locations"""
-        self.ui.print_plain("Configured Locations:")
+        # Remove the "Configured Locations:" header
 
         if self.config.source_locations:
-            self.ui.print_info("\nSource locations:")
-            for i, location in enumerate(self.config.source_locations, 1):
-                self.ui.console.print(f"  {i}. {location}")
+            self.ui.print_info("Source locations:")
+            for location in self.config.source_locations:
+                self.ui.console.print(f"  {location}")
         else:
             self.ui.print_warning("\nNo source locations configured")
 
         if self.config.target_location:
-            self.ui.print_info(f"\nTarget location:\n  {self.config.target_location}")
+            # Check if target location exists
+            target_path = pathlib.Path(self.config.target_location)
+            if target_path.exists():
+                self.ui.print_info("\nTarget location:")
+                self.ui.console.print(f"  {self.config.target_location}")
+            else:
+                self.ui.print_info("\nTarget location:")
+                self.ui.print_error(f"  {self.config.target_location} (does not exist)")
         else:
             self.ui.print_warning("\nNo target location configured")
 
         if self.config.reference_location:
-            self.ui.print_info(f"\nReference location (read-only):\n  {self.config.reference_location}")
+            self.ui.print_info("\nReference location (read-only):")
+            self.ui.console.print(f"  {self.config.reference_location}")
         else:
             self.ui.print_warning("\nNo reference location configured")
 
@@ -372,13 +398,13 @@ class Monosis:
             return False
 
         # Phase 1: Discovery
-        self.ui.print_info("\n=== Phase 1: File Discovery ===")
+        self.ui.print_info("\nPhase 1: File Discovery\n")
         file_inventory = self._discover_files()
         if not file_inventory:
             return False
 
         # Phase 2: Duplicate Detection
-        self.ui.print_info("\n=== Phase 2: Duplicate Detection ===")
+        self.ui.print_info("\nPhase 2: Duplicate Detection\n")
         duplicates = self._detect_duplicates(file_inventory)
 
         # Update scan time and save results
@@ -419,55 +445,120 @@ class Monosis:
         extensions = set(self.args.extensions) if self.args.extensions else None
         file_inventory = {"locations": {}, "files_by_location": defaultdict(list), "total_files": 0, "total_size": 0}
 
-        with self.ui.create_progress() as progress:
+        # Scan each location with progress updates
+        with self.ui.create_activity_progress() as progress:
             discovery_task = progress.add_task("Discovering files...", total=None)
 
             for location_type, location_str, location_path in locations_to_scan:
                 location_files = []
                 location_size = 0
-                pattern = "**/*" if self.args.recursive else "*"
+                # pattern removed since we use os.walk or iterdir directly
 
-                # Update progress to show current location being scanned
-                location_display = location_str.replace(str(pathlib.Path.home()), "~")  # Shorten home path
-                progress.update(
-                    discovery_task,
-                    description=f"Scanning {location_display}... ({file_inventory['total_files']:,} files found so far)",
-                )
+                # Show current location being scanned
+                location_display = location_str.replace(str(pathlib.Path.home()), "~")
 
-                # Scan this location
-                for file_path in location_path.glob(pattern):
-                    if not file_path.is_file():
-                        continue
+                # Scan this location using os.walk for better performance
+                if self.args.recursive:
+                    # Recursive scan using os.walk
+                    for root, _dirs, files in os.walk(location_path):
+                        for filename in files:
+                            file_path = pathlib.Path(root) / filename
 
-                    if extensions:
-                        ext = file_path.suffix.lower().lstrip(".")
-                        if ext not in extensions:
-                            continue
+                            if extensions:
+                                ext = file_path.suffix.lower().lstrip(".")
+                                if ext not in extensions:
+                                    continue
 
+                            try:
+                                stat_result = file_path.stat()
+                                file_size = stat_result.st_size
+                                file_mtime = stat_result.st_mtime
+
+                                file_info = {
+                                    "path": file_path,
+                                    "size": file_size,
+                                    "mtime": file_mtime,
+                                    "location_type": location_type,
+                                    "location": location_str,
+                                }
+
+                                location_files.append(file_info)
+                                location_size += file_size
+
+                                # Update progress periodically (every 1000 files)
+                                if len(location_files) % 1000 == 0:
+                                    total_files_so_far = file_inventory["total_files"] + len(location_files)
+                                    total_size_so_far = file_inventory["total_size"] + location_size
+
+                                    # Format size for display
+                                    if total_size_so_far >= 1024**3:
+                                        size_str = f"{total_size_so_far / (1024**3):.1f} GiB"
+                                    elif total_size_so_far >= 1024**2:
+                                        size_str = f"{total_size_so_far / (1024**2):.1f} MiB"
+                                    elif total_size_so_far >= 1024:
+                                        size_str = f"{total_size_so_far / 1024:.1f} KiB"
+                                    else:
+                                        size_str = f"{total_size_so_far} B"
+
+                                    progress.update(
+                                        discovery_task,
+                                        description=f"Scanning {location_display} → {total_files_so_far:,} files, {size_str}",
+                                    )
+
+                            except OSError:
+                                continue  # Skip files we can't stat
+                else:
+                    # Non-recursive scan - just list files in the directory
                     try:
-                        file_size = file_path.stat().st_size
-                        file_mtime = file_path.stat().st_mtime
+                        for item in location_path.iterdir():
+                            if not item.is_file():
+                                continue
 
-                        file_info = {
-                            "path": file_path,
-                            "size": file_size,
-                            "mtime": file_mtime,
-                            "location_type": location_type,
-                            "location": location_str,
-                        }
+                            if extensions:
+                                ext = item.suffix.lower().lstrip(".")
+                                if ext not in extensions:
+                                    continue
 
-                        location_files.append(file_info)
-                        location_size += file_size
+                            try:
+                                stat_result = item.stat()
+                                file_size = stat_result.st_size
+                                file_mtime = stat_result.st_mtime
 
-                        # Update progress periodically (every 1000 files)
-                        if len(location_files) % 1000 == 0:
-                            progress.update(
-                                discovery_task,
-                                description=f"Scanning {location_display}... ({file_inventory['total_files'] + len(location_files):,} files found so far)",
-                            )
+                                file_info = {
+                                    "path": item,
+                                    "size": file_size,
+                                    "mtime": file_mtime,
+                                    "location_type": location_type,
+                                    "location": location_str,
+                                }
 
+                                location_files.append(file_info)
+                                location_size += file_size
+
+                                # Update progress periodically (every 1000 files)
+                                if len(location_files) % 1000 == 0:
+                                    total_files_so_far = file_inventory["total_files"] + len(location_files)
+                                    total_size_so_far = file_inventory["total_size"] + location_size
+
+                                    # Format size for display
+                                    if total_size_so_far >= 1024**3:
+                                        size_str = f"{total_size_so_far / (1024**3):.1f} GiB"
+                                    elif total_size_so_far >= 1024**2:
+                                        size_str = f"{total_size_so_far / (1024**2):.1f} MiB"
+                                    elif total_size_so_far >= 1024:
+                                        size_str = f"{total_size_so_far / 1024:.1f} KiB"
+                                    else:
+                                        size_str = f"{total_size_so_far} B"
+
+                                    progress.update(
+                                        discovery_task,
+                                        description=f"Scanning {location_display} → {total_files_so_far:,} files, {size_str}",
+                                    )
+
+                            except OSError:
+                                continue  # Skip files we can't stat
                     except OSError:
-                        continue  # Skip files we can't stat
+                        self.ui.print_warning(f"Cannot access directory: {location_path}")
 
                 # Store location info
                 file_inventory["locations"][location_str] = {
@@ -481,19 +572,49 @@ class Monosis:
                 file_inventory["total_files"] += len(location_files)
                 file_inventory["total_size"] += location_size
 
-                # Update progress after completing this location
+                # Final update for this location
+                total_size_gib = file_inventory["total_size"] / (1024**3)
+                if total_size_gib >= 1:
+                    size_str = f"{total_size_gib:.1f} GiB"
+                elif file_inventory["total_size"] >= 1024**2:
+                    size_str = f"{file_inventory['total_size'] / (1024**2):.1f} MiB"
+                elif file_inventory["total_size"] >= 1024:
+                    size_str = f"{file_inventory['total_size'] / 1024:.1f} KiB"
+                else:
+                    size_str = f"{file_inventory['total_size']} B"
+
                 progress.update(
                     discovery_task,
-                    description=f"Completed {location_display}: {len(location_files):,} files ({location_size / (1024**3):.1f} GB)",
+                    description=f"Completed {location_display} → Total: {file_inventory['total_files']:,} files, {size_str}",
                 )
 
-        # Show discovery summary
-        self.ui.print_success("Discovery complete:")
+        # Show discovery summary in table format
+
+        from rich.table import Table
+
+        table = Table(show_header=False, box=None, pad_edge=False)
+        table.add_column("Type", width=2, justify="center")
+        table.add_column("Location", style="white")
+        table.add_column("Files", justify="right", style="white")
+        table.add_column("Size", justify="right", style="white")
+
         for location_str, info in file_inventory["locations"].items():
-            location_type = "📁" if info["type"] == "source" else "📚"
-            self.ui.console.print(
-                f"  {location_type} {location_str}: {info['count']:,} files ({info['size'] / (1024**3):.1f} GB)"
-            )
+            location_type_symbol = "📁"  # folder emoji for all locations
+            location_type_text = "source" if info["type"] == "source" else "reference"
+            
+            size_gib = info["size"] / (1024**3)
+            if size_gib >= 1:
+                size_str = f"{size_gib:.1f} GiB"
+            elif info["size"] >= 1024**2:
+                size_str = f"{info['size'] / (1024**2):.1f} MiB"
+            elif info["size"] >= 1024:
+                size_str = f"{info['size'] / 1024:.1f} KiB"
+            else:
+                size_str = f"{info['size']} B"
+
+            table.add_row(location_type_symbol, location_str, f"{info['count']:,}", f"{size_str} ({location_type_text})")
+
+        self.ui.console.print(table)
 
         return file_inventory
 
@@ -508,7 +629,7 @@ class Monosis:
             all_files.extend([file_info["path"] for file_info in location_files])
 
         # Group by size first (optimization)
-        self.ui.print_info("Grouping files by size...")
+        self.ui.console.print("Grouping files by size...", style="white dim")
         size_groups = defaultdict(list)
         for file_info in [item for sublist in file_inventory["files_by_location"].values() for item in sublist]:
             size_groups[file_info["size"]].append(file_info)
@@ -522,8 +643,9 @@ class Monosis:
             else:
                 unique_files += 1
 
-        self.ui.print_info(
-            f"Size analysis: {unique_files:,} unique sizes, {len(potential_duplicates):,} files need hashing"
+        self.ui.console.print(
+            f"Size analysis: {unique_files:,} unique sizes, {len(potential_duplicates):,} files need hashing",
+            style="white dim",
         )
 
         if not potential_duplicates:
@@ -531,8 +653,27 @@ class Monosis:
             return {}
 
         # Hash potential duplicates with progress
-        self.ui.print_info("Hashing potential duplicates...")
-        duplicates = self.duplicate_detector.find_duplicates(potential_duplicates)
+
+        self.ui.console.print()  # Empty line before hashing
+
+        with self.ui.create_progress() as progress:
+            hash_task = progress.add_task("Computing hashes...", total=len(potential_duplicates))
+            duplicates = {}
+
+            # Process files in batches and cache results incrementally
+            batch_size = 100
+            for i in range(0, len(potential_duplicates), batch_size):
+                batch = potential_duplicates[i : i + batch_size]
+                batch_duplicates = self.duplicate_detector.find_duplicates(batch)
+                duplicates.update(batch_duplicates)
+
+                # Cache the hashes for files in this batch
+                self._cache_batch_hashes(batch, batch_duplicates)
+
+                processed = min(i + batch_size, len(potential_duplicates))
+
+                # Update progress
+                progress.update(hash_task, completed=processed)
 
         return duplicates
 
@@ -673,7 +814,7 @@ class Monosis:
 
         # Show categorized summary
         self.ui.print_success("\n=== Scan Complete ===")
-        self.ui.print_info(f"Found {len(duplicates)} groups of duplicates")
+        self.ui.print_info(f"Found {len(duplicates):,} groups of duplicates")
 
         if new_files > 0:
             self.ui.print_info(f"📝 New files (need backup): {new_files}")
@@ -791,51 +932,128 @@ class Monosis:
 
     def cmd_status(self):
         """Show configuration and scan status"""
-        self.ui.print_header("Monosis Status")
-
         # Show locations
         self._locations_list()
 
         # Check cache database
+        self.ui.print_info("\nCache Status")
         if self.cache_db.exists():
+            cache_size = self.cache_db.stat().st_size
+            if cache_size >= 1024**3:
+                cache_size_str = f"{cache_size / (1024**3):.1f} GiB"
+            elif cache_size >= 1024**2:
+                cache_size_str = f"{cache_size / (1024**2):.1f} MiB"
+            elif cache_size >= 1024:
+                cache_size_str = f"{cache_size / 1024:.1f} KiB"
+            else:
+                cache_size_str = f"{cache_size} B"
+            
             with sqlite3.connect(self.cache_db) as conn:
                 cursor = conn.execute("SELECT COUNT(*) FROM file_hashes")
                 count = cursor.fetchone()[0]
-                self.ui.print_info(f"\nCached file hashes: {count}")
+                self.ui.console.print(f"  Number of hashes: {count:,} ({cache_size_str})", style="white dim")
         else:
-            self.ui.print_info("\nNo cache database found")
+            self.ui.console.print("  No cache database found", style="white dim")
 
         # Check scan results
         if self.scan_results_file.exists():
             with self.scan_results_file.open() as f:
                 data = json.load(f)
-                self.ui.print_info(f"\nLast scan: {data['timestamp']}")
-                self.ui.print_info(f"Duplicate groups: {data['summary']['duplicate_groups']}")
-                self.ui.print_info(f"Total duplicates: {data['summary']['total_duplicates']}")
-                self.ui.print_info(f"Wasted space: {data['summary']['wasted_space_gb']:.2f} GB")
+                self.ui.console.print(f"  Last scan: {data['timestamp']}", style="white dim")
+                self.ui.console.print(f"  Duplicate groups: {data['summary']['duplicate_groups']:,}", style="white dim")
+                self.ui.console.print(f"  Total duplicates: {data['summary']['total_duplicates']:,}", style="white dim")
+                # Handle both old 'wasted_space_gb' and new 'wasted_space_gib' keys
+                wasted_space_key = "wasted_space_gib" if "wasted_space_gib" in data["summary"] else "wasted_space_gb"
+                wasted_gib = data["summary"][wasted_space_key]
+                if wasted_gib >= 1:
+                    wasted_str = f"{wasted_gib:.2f} GiB"
+                elif wasted_gib * (1024**3) >= 1024**2:
+                    wasted_str = f"{wasted_gib * (1024**3) / (1024**2):.1f} MiB"
+                elif wasted_gib * (1024**3) >= 1024:
+                    wasted_str = f"{wasted_gib * (1024**3) / 1024:.1f} KiB"
+                else:
+                    wasted_str = f"{int(wasted_gib * (1024**3))} B"
+                self.ui.console.print(f"  Wasted space: {wasted_str}", style="white dim")
         else:
-            self.ui.print_info("\nNo scan results found")
+            self.ui.console.print("  No scan results found", style="white dim")
 
         if self.config.last_consolidation:
-            self.ui.print_info(f"\nLast consolidation: {self.config.last_consolidation}")
+            self.ui.console.print(f"  Last consolidation: {self.config.last_consolidation}", style="white dim")
 
+        self.ui.console.print()  # Empty line at the end
         return True
 
     def cmd_clean(self):
         """Clean cache and results"""
+        if hasattr(self.args, "cache_only") and self.args.cache_only:
+            return self._clean_cache_only()
+        
         if self.ui.confirm("\nThis will delete all cached data and scan results. Continue?"):
+            cache_deleted = False
+            results_deleted = False
+            
             if self.cache_db.exists():
-                self.cache_db.unlink()
-                self.ui.print_success("Cache database deleted")
+                # Clear in-memory cache and force garbage collection
+                self.duplicate_detector._hash_cache.clear()
+                import gc
+                gc.collect()
+                
+                try:
+                    self.cache_db.unlink()
+                    self.ui.print_success("Cache database deleted")
+                    cache_deleted = True
+                except PermissionError:
+                    self.ui.print_error("Cannot delete cache database - it may be in use")
+                    cache_deleted = False
 
             if self.scan_results_file.exists():
                 self.scan_results_file.unlink()
                 self.ui.print_success("Scan results deleted")
-
-            self.ui.print_success("Cache cleaned successfully")
+                results_deleted = True
+            
+            if cache_deleted or results_deleted:
+                self.ui.print_success("Clean operation completed")
+            else:
+                self.ui.print_info("No files to clean")
         else:
             self.ui.print_info("Clean operation cancelled")
 
+        return True
+    
+    def _clean_cache_only(self):
+        """Clean only the hash cache database"""
+        if self.cache_db.exists():
+            cache_size = self.cache_db.stat().st_size
+            if cache_size >= 1024**3:
+                cache_size_str = f"{cache_size / (1024**3):.1f} GiB"
+            elif cache_size >= 1024**2:
+                cache_size_str = f"{cache_size / (1024**2):.1f} MiB"
+            elif cache_size >= 1024:
+                cache_size_str = f"{cache_size / 1024:.1f} KiB"
+            else:
+                cache_size_str = f"{cache_size} B"
+            
+            if self.ui.confirm(f"\nThis will delete the hash cache database ({cache_size_str}). Continue?"):
+                # Force close any open connections and clear the in-memory cache
+                self.duplicate_detector._hash_cache.clear()
+                
+                try:
+                    # Try to close any lingering SQLite connections
+                    import gc
+                    gc.collect()  # Force garbage collection to close connections
+                    
+                    self.cache_db.unlink()
+                    self.ui.print_success("Hash cache cleared")
+                    self.ui.print_info("Scan results preserved")
+                except PermissionError:
+                    self.ui.print_error("Cannot delete cache database - it may be in use by another process")
+                    self.ui.print_info("Try closing any other instances of monosis and run the command again")
+                    return False
+            else:
+                self.ui.print_info("Cache clean cancelled")
+        else:
+            self.ui.print_info("No cache database found")
+            
         return True
 
     def _save_scan_results(self, duplicates: dict, scanned_paths: list[pathlib.Path], file_paths_by_location: dict):
@@ -973,6 +1191,56 @@ class Monosis:
 
         return stats
 
+    def _cache_batch_hashes(self, file_paths: list[pathlib.Path], duplicates: dict):
+        """Cache hashes for a batch of files to SQLite database"""
+        import time
+
+        current_time = time.time()
+        cache_entries = []
+
+        # For each file in the batch, get its hash and prepare cache entry
+        for file_path in file_paths:
+            try:
+                stat = file_path.stat()
+                file_size = stat.st_size
+                mtime = stat.st_mtime
+
+                # Find the hash for this file from the duplicates result
+                file_hash = None
+                for hash_val, paths in duplicates.items():
+                    if file_path in paths:
+                        file_hash = hash_val
+                        break
+
+                # If we found a hash, prepare cache entry
+                if file_hash:
+                    cache_entries.append(
+                        (
+                            str(file_path),
+                            file_size,
+                            mtime,
+                            None,  # quick_hash
+                            file_hash,  # full_hash
+                            current_time,
+                        )
+                    )
+
+            except OSError:
+                continue  # Skip files we can't stat
+
+        # Batch insert into cache database
+        if cache_entries:
+            with sqlite3.connect(self.cache_db) as conn:
+                conn.executemany(
+                    """
+                    INSERT OR REPLACE INTO file_hashes 
+                    (file_path, file_size, mtime, quick_hash, full_hash, last_scan)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                    cache_entries,
+                )
+                conn.commit()
+
 
 def main():
     """Main entry point"""
@@ -1061,7 +1329,8 @@ Examples:
     subparsers.add_parser("status", help="Show configuration and statistics")
 
     # Clean command
-    subparsers.add_parser("clean", help="Clean cache and results")
+    clean_parser = subparsers.add_parser("clean", help="Clean cache and results")
+    clean_parser.add_argument("--cache-only", action="store_true", help="Only clear hash cache, preserve scan results")
 
     args = parser.parse_args()
 

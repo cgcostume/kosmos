@@ -103,6 +103,22 @@ class ConsoleUI:
             console=self.console,
         )
 
+    def create_activity_progress(self):
+        """Create a Rich progress context manager for activity-only display (no counts)"""
+        from rich.progress import (
+            Progress,
+            SpinnerColumn,
+            TextColumn,
+            TimeElapsedColumn,
+        )
+
+        return Progress(
+            SpinnerColumn(),
+            TextColumn("{task.description}"),
+            TimeElapsedColumn(),
+            console=self.console,
+        )
+
     def create_progress_bar(self, description: str = "Processing") -> str:
         """Create a new progress bar and return its ID"""
         if not self._current_progress:

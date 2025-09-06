@@ -15,7 +15,14 @@ Features:
 
 import hashlib
 import pathlib
-from typing import Dict, List, Optional, Set
+from typing import Optional
+
+try:
+    import xxhash
+
+    XXHASH_AVAILABLE = True
+except ImportError:
+    XXHASH_AVAILABLE = False
 
 
 class DuplicateDetector:
@@ -25,18 +32,27 @@ class DuplicateDetector:
         """Initialize duplicate detector
 
         Args:
-            hash_algorithm: Hash algorithm to use ('md5' or 'sha256')
+            hash_algorithm: Hash algorithm to use ('md5', 'sha256', or 'xxhash64')
             chunk_size: Chunk size for streaming hash calculation
         """
         self.hash_algorithm = hash_algorithm.lower()
         self.chunk_size = chunk_size
 
-        if self.hash_algorithm not in ("md5", "sha256"):
-            raise ValueError("Hash algorithm must be 'md5' or 'sha256'")
+        if self.hash_algorithm == "xxhash64" and not XXHASH_AVAILABLE:
+            raise ValueError("xxhash package required for xxhash64 algorithm. Install with: pip install xxhash")
+
+        if self.hash_algorithm not in ("md5", "sha256", "xxhash64"):
+            raise ValueError("Hash algorithm must be 'md5', 'sha256', or 'xxhash64'")
 
         # Simple in-memory cache: file_path -> hash
         self._hash_cache: dict[str, str] = {}
-        self._hash_func = hashlib.md5 if hash_algorithm == "md5" else hashlib.sha256
+
+        if hash_algorithm == "md5":
+            self._hash_func = hashlib.md5
+        elif hash_algorithm == "sha256":
+            self._hash_func = hashlib.sha256
+        else:  # xxhash64
+            self._hash_func = None  # Will use xxhash.xxh64() directly
 
     def calculate_file_hash(self, file_path: pathlib.Path) -> str:
         """Calculate hash of a file with in-memory caching
@@ -57,22 +73,27 @@ class DuplicateDetector:
             return self._hash_cache[file_key]
 
         # Calculate hash
-        hash_obj = self._hash_func()
-
         try:
-            with open(file_path, "rb") as f:
-                while chunk := f.read(self.chunk_size):
-                    hash_obj.update(chunk)
-
-            file_hash = hash_obj.hexdigest()
+            if self.hash_algorithm == "xxhash64":
+                hash_obj = xxhash.xxh64()
+                with file_path.open("rb") as f:
+                    while chunk := f.read(self.chunk_size):
+                        hash_obj.update(chunk)
+                file_hash = hash_obj.hexdigest()
+            else:
+                # Use standard hashlib
+                hash_obj = self._hash_func()
+                with file_path.open("rb") as f:
+                    while chunk := f.read(self.chunk_size):
+                        hash_obj.update(chunk)
+                file_hash = hash_obj.hexdigest()
 
             # Store in memory cache
             self._hash_cache[file_key] = file_hash
-
             return file_hash
 
         except OSError as e:
-            raise OSError(f"Cannot read file {file_path}: {e}")
+            raise OSError(f"Cannot read file {file_path}: {e}") from e
 
     def files_are_identical(self, file1: pathlib.Path, file2: pathlib.Path) -> bool:
         """Check if two files are identical
@@ -128,7 +149,7 @@ class DuplicateDetector:
 
         # Only check files that have potential duplicates (same size)
         potential_duplicates = []
-        for size, paths in size_groups.items():
+        for _size, paths in size_groups.items():
             if len(paths) > 1:
                 potential_duplicates.extend(paths)
 
