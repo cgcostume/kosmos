@@ -180,11 +180,16 @@ class Monosis:
         """Add source locations"""
         added = 0
         for path in self.args.paths:
-            if not path.exists():
-                self.ui.print_error(f"Path does not exist: {path}")
+            # Handle network paths on Windows
+            resolved_path = self._resolve_network_path(path)
+            if not resolved_path:
                 continue
-            if not path.is_dir():
-                self.ui.print_error(f"Not a directory: {path}")
+
+            if not resolved_path.exists():
+                self.ui.print_error(f"Path does not exist: {resolved_path}")
+                continue
+            if not resolved_path.is_dir():
+                self.ui.print_error(f"Not a directory: {resolved_path}")
                 continue
 
             # Safety check: source cannot contain the target location
@@ -204,26 +209,47 @@ class Monosis:
                     self.ui.print_error("Choose a source location outside the target directory.")
                     continue
 
-            if self.config.add_source(path):
-                self.ui.print_success(f"Added source location: {path.resolve()}")
+            if self.config.add_source(resolved_path):
+                self.ui.print_success(f"Added source location: {resolved_path.resolve()}")
                 added += 1
             else:
-                self.ui.print_warning(f"Location already configured: {path.resolve()}")
+                self.ui.print_warning(f"Location already configured: {resolved_path.resolve()}")
 
         if added > 0:
             self.config_manager.save(self.config)
 
         return True
 
+    def _resolve_network_path(self, path: pathlib.Path) -> Optional[pathlib.Path]:
+        """Resolve network paths and handle Windows UNC paths like \\server\share"""
+        try:
+            path_str = str(path)
+
+            # Handle Windows UNC paths (\\server\share)
+            if sys.platform == "win32" and path_str.startswith("\\\\"):
+                # Convert to WindowsPath with proper UNC handling
+                return pathlib.WindowsPath(path_str)
+
+            # Handle regular paths
+            return path.resolve()
+
+        except (OSError, ValueError) as e:
+            self.ui.print_error(f"Invalid path format: {path} ({e})")
+            return None
+
     def _locations_remove(self):
         """Remove source locations"""
         removed = 0
         for path in self.args.paths:
-            if self.config.remove_source(path):
-                self.ui.print_success(f"Removed source location: {path.resolve()}")
+            resolved_path = self._resolve_network_path(path)
+            if not resolved_path:
+                continue
+
+            if self.config.remove_source(resolved_path):
+                self.ui.print_success(f"Removed source location: {resolved_path.resolve()}")
                 removed += 1
             else:
-                self.ui.print_warning(f"Location not found: {path.resolve()}")
+                self.ui.print_warning(f"Location not found: {resolved_path.resolve()}")
 
         if removed > 0:
             self.config_manager.save(self.config)
@@ -233,15 +259,19 @@ class Monosis:
     def _locations_set_target(self):
         """Set target location"""
         path = self.args.path
-        if not path.exists():
-            self.ui.print_error(f"Path does not exist: {path}")
+        resolved_path = self._resolve_network_path(path)
+        if not resolved_path:
             return False
-        if not path.is_dir():
-            self.ui.print_error(f"Not a directory: {path}")
+
+        if not resolved_path.exists():
+            self.ui.print_error(f"Path does not exist: {resolved_path}")
+            return False
+        if not resolved_path.is_dir():
+            self.ui.print_error(f"Not a directory: {resolved_path}")
             return False
 
         # Safety check: target cannot be inside any source location
-        target_resolved = str(path.resolve())
+        target_resolved = str(resolved_path.resolve())
         for source_location in self.config.source_locations:
             source_path = pathlib.Path(source_location).resolve()
 
@@ -257,24 +287,28 @@ class Monosis:
                 self.ui.print_error("Remove the source location first, or choose a different target.")
                 return False
 
-        self.config.set_target(path)
+        self.config.set_target(resolved_path)
         self.config_manager.save(self.config)
-        self.ui.print_success(f"Set target location: {path.resolve()}")
+        self.ui.print_success(f"Set target location: {resolved_path.resolve()}")
 
         return True
 
     def _locations_set_reference(self):
         """Set reference location"""
         path = self.args.path
-        if not path.exists():
-            self.ui.print_error(f"Path does not exist: {path}")
+        resolved_path = self._resolve_network_path(path)
+        if not resolved_path:
             return False
-        if not path.is_dir():
-            self.ui.print_error(f"Not a directory: {path}")
+
+        if not resolved_path.exists():
+            self.ui.print_error(f"Path does not exist: {resolved_path}")
+            return False
+        if not resolved_path.is_dir():
+            self.ui.print_error(f"Not a directory: {resolved_path}")
             return False
 
         # Safety check: reference cannot be same as target or any source
-        reference_resolved = str(path.resolve())
+        reference_resolved = str(resolved_path.resolve())
 
         # Check against target
         if self.config.target_location:
@@ -290,9 +324,9 @@ class Monosis:
                 self.ui.print_error("Reference location cannot be the same as a source location")
                 return False
 
-        self.config.set_reference(path)
+        self.config.set_reference(resolved_path)
         self.config_manager.save(self.config)
-        self.ui.print_success(f"Set reference location: {path.resolve()}")
+        self.ui.print_success(f"Set reference location: {resolved_path.resolve()}")
 
         return True
 
@@ -331,40 +365,77 @@ class Monosis:
         return True
 
     def cmd_scan(self):
-        """Scan configured locations for duplicates"""
+        """Scan configured locations for duplicates using two-phase approach"""
         # Check if locations are configured
         if not self.config.source_locations:
             self.ui.print_error("No source locations configured. Use 'monosis locations add' first.")
             return False
 
-        # Get valid paths
-        valid_paths = []
+        # Phase 1: Discovery
+        self.ui.print_info("\n=== Phase 1: File Discovery ===")
+        file_inventory = self._discover_files()
+        if not file_inventory:
+            return False
+
+        # Phase 2: Duplicate Detection
+        self.ui.print_info("\n=== Phase 2: Duplicate Detection ===")
+        duplicates = self._detect_duplicates(file_inventory)
+
+        # Update scan time and save results
+        self.config.update_scan_time()
+        self.config_manager.save(self.config)
+
+        # Save and show results
+        self._save_scan_results_v2(duplicates, file_inventory)
+        self._show_scan_summary_v2(duplicates, file_inventory)
+
+        return True
+
+    def _discover_files(self) -> dict:
+        """Phase 1: Discover all files and build inventory"""
+        # Get all locations to scan (sources + reference)
+        locations_to_scan = []
+
+        # Add source locations
         for location in self.config.source_locations:
             path = pathlib.Path(location)
             if path.exists() and path.is_dir():
-                valid_paths.append(path)
+                locations_to_scan.append(("source", location, path))
             else:
-                self.ui.print_warning(f"Skipping invalid location: {location}")
+                self.ui.print_warning(f"Skipping invalid source location: {location}")
 
-        if not valid_paths:
-            self.ui.print_error("No valid source locations found")
-            return False
+        # Add reference location if configured
+        if self.config.reference_location:
+            path = pathlib.Path(self.config.reference_location)
+            if path.exists() and path.is_dir():
+                locations_to_scan.append(("reference", self.config.reference_location, path))
+            else:
+                self.ui.print_warning(f"Skipping invalid reference location: {self.config.reference_location}")
 
-        self.ui.print_info(f"\nScanning {len(valid_paths)} locations...")
+        if not locations_to_scan:
+            self.ui.print_error("No valid locations found")
+            return {}
 
-        # Find all files
         extensions = set(self.args.extensions) if self.args.extensions else None
-        file_paths_by_location = defaultdict(list)
-        all_file_paths = []
+        file_inventory = {"locations": {}, "files_by_location": defaultdict(list), "total_files": 0, "total_size": 0}
 
         with self.ui.create_progress() as progress:
-            scan_task = progress.add_task("Finding files...", total=None)
+            discovery_task = progress.add_task("Discovering files...", total=None)
 
-            for directory in valid_paths:
+            for location_type, location_str, location_path in locations_to_scan:
                 location_files = []
+                location_size = 0
                 pattern = "**/*" if self.args.recursive else "*"
 
-                for file_path in directory.glob(pattern):
+                # Update progress to show current location being scanned
+                location_display = location_str.replace(str(pathlib.Path.home()), "~")  # Shorten home path
+                progress.update(
+                    discovery_task,
+                    description=f"Scanning {location_display}... ({file_inventory['total_files']:,} files found so far)",
+                )
+
+                # Scan this location
+                for file_path in location_path.glob(pattern):
                     if not file_path.is_file():
                         continue
 
@@ -373,35 +444,250 @@ class Monosis:
                         if ext not in extensions:
                             continue
 
-                    location_files.append(file_path)
-                    all_file_paths.append(file_path)
-                    progress.update(scan_task, description=f"Found {len(all_file_paths)} files...")
+                    try:
+                        file_size = file_path.stat().st_size
+                        file_mtime = file_path.stat().st_mtime
 
-                file_paths_by_location[str(directory)] = location_files
+                        file_info = {
+                            "path": file_path,
+                            "size": file_size,
+                            "mtime": file_mtime,
+                            "location_type": location_type,
+                            "location": location_str,
+                        }
 
-            progress.update(scan_task, completed=len(all_file_paths), total=len(all_file_paths))
+                        location_files.append(file_info)
+                        location_size += file_size
 
-        if not all_file_paths:
-            self.ui.print_warning("No files found to scan")
-            return True
+                        # Update progress periodically (every 1000 files)
+                        if len(location_files) % 1000 == 0:
+                            progress.update(
+                                discovery_task,
+                                description=f"Scanning {location_display}... ({file_inventory['total_files'] + len(location_files):,} files found so far)",
+                            )
 
-        self.ui.print_success(f"Found {len(all_file_paths)} files to analyze")
+                    except OSError:
+                        continue  # Skip files we can't stat
 
-        # Find duplicates with progress
-        self.ui.print_info("\nAnalyzing files for duplicates...")
-        duplicates = self.duplicate_detector.find_duplicates(all_file_paths)
+                # Store location info
+                file_inventory["locations"][location_str] = {
+                    "type": location_type,
+                    "files": location_files,
+                    "count": len(location_files),
+                    "size": location_size,
+                }
 
-        # Update scan time
-        self.config.update_scan_time()
-        self.config_manager.save(self.config)
+                file_inventory["files_by_location"][location_str] = location_files
+                file_inventory["total_files"] += len(location_files)
+                file_inventory["total_size"] += location_size
 
-        # Save results with location information
-        self._save_scan_results(duplicates, valid_paths, file_paths_by_location)
+                # Update progress after completing this location
+                progress.update(
+                    discovery_task,
+                    description=f"Completed {location_display}: {len(location_files):,} files ({location_size / (1024**3):.1f} GB)",
+                )
 
-        # Show summary
-        self._show_scan_summary(duplicates, file_paths_by_location)
+        # Show discovery summary
+        self.ui.print_success("Discovery complete:")
+        for location_str, info in file_inventory["locations"].items():
+            location_type = "📁" if info["type"] == "source" else "📚"
+            self.ui.console.print(
+                f"  {location_type} {location_str}: {info['count']:,} files ({info['size'] / (1024**3):.1f} GB)"
+            )
 
-        return True
+        return file_inventory
+
+    def _detect_duplicates(self, file_inventory: dict) -> dict:
+        """Phase 2: Detect duplicates with smart filtering"""
+        if file_inventory["total_files"] == 0:
+            return {}
+
+        # Collect all files for duplicate detection
+        all_files = []
+        for location_files in file_inventory["files_by_location"].values():
+            all_files.extend([file_info["path"] for file_info in location_files])
+
+        # Group by size first (optimization)
+        self.ui.print_info("Grouping files by size...")
+        size_groups = defaultdict(list)
+        for file_info in [item for sublist in file_inventory["files_by_location"].values() for item in sublist]:
+            size_groups[file_info["size"]].append(file_info)
+
+        # Only process files that have potential duplicates
+        potential_duplicates = []
+        unique_files = 0
+        for _size, files in size_groups.items():
+            if len(files) > 1:
+                potential_duplicates.extend([f["path"] for f in files])
+            else:
+                unique_files += 1
+
+        self.ui.print_info(
+            f"Size analysis: {unique_files:,} unique sizes, {len(potential_duplicates):,} files need hashing"
+        )
+
+        if not potential_duplicates:
+            self.ui.print_success("No potential duplicates found (all files have unique sizes)")
+            return {}
+
+        # Hash potential duplicates with progress
+        self.ui.print_info("Hashing potential duplicates...")
+        duplicates = self.duplicate_detector.find_duplicates(potential_duplicates)
+
+        return duplicates
+
+    def _save_scan_results_v2(self, duplicates: dict, file_inventory: dict):
+        """Save enhanced scan results with location categorization"""
+        # Calculate enhanced statistics
+        total_files = sum(len(paths) for paths in duplicates.values())
+        total_size = 0
+        wasted_space = 0
+
+        # Categorize duplicates by location type
+        enhanced_duplicates = {}
+        location_analysis = {
+            "new_files": [],  # In sources only
+            "backed_up_files": [],  # In sources AND reference
+            "source_duplicates": [],  # Multiple copies in sources
+        }
+
+        for hash_val, paths in duplicates.items():
+            if not paths:
+                continue
+
+            file_size = paths[0].stat().st_size
+            total_size += file_size * len(paths)
+            wasted_space += file_size * (len(paths) - 1)
+
+            # Categorize by location types
+            source_files = []
+            reference_files = []
+
+            for file_path in paths:
+                # Find which location this file belongs to
+                for location_str, location_info in file_inventory["locations"].items():
+                    if str(file_path).startswith(location_str):
+                        if location_info["type"] == "source":
+                            source_files.append(str(file_path))
+                        elif location_info["type"] == "reference":
+                            reference_files.append(str(file_path))
+                        break
+
+            # Determine category
+            has_source = len(source_files) > 0
+            has_reference = len(reference_files) > 0
+            multiple_sources = len(source_files) > 1
+
+            category = "unknown"
+            if has_source and not has_reference:
+                category = "source_only"
+                if multiple_sources:
+                    location_analysis["source_duplicates"].extend(source_files)
+                else:
+                    location_analysis["new_files"].extend(source_files)
+            elif has_source and has_reference:
+                category = "backed_up"
+                location_analysis["backed_up_files"].extend(source_files)
+            elif has_reference and not has_source:
+                category = "reference_only"
+
+            enhanced_duplicates[hash_val] = {
+                "files": [str(p) for p in paths],
+                "source_files": source_files,
+                "reference_files": reference_files,
+                "category": category,
+                "file_size": file_size,
+            }
+
+        # Prepare enhanced data
+        data = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "locations": {
+                "sources": [loc for loc, info in file_inventory["locations"].items() if info["type"] == "source"],
+                "reference": [loc for loc, info in file_inventory["locations"].items() if info["type"] == "reference"],
+            },
+            "discovery": {
+                "total_files": file_inventory["total_files"],
+                "total_size_gb": file_inventory["total_size"] / (1024**3),
+                "location_details": {
+                    loc: {"count": info["count"], "size_gb": info["size"] / (1024**3), "type": info["type"]}
+                    for loc, info in file_inventory["locations"].items()
+                },
+            },
+            "summary": {
+                "duplicate_groups": len(duplicates),
+                "total_duplicates": total_files,
+                "total_size_gb": total_size / (1024**3),
+                "wasted_space_gb": wasted_space / (1024**3),
+                "new_files_count": len(location_analysis["new_files"]),
+                "backed_up_files_count": len(location_analysis["backed_up_files"]),
+                "source_duplicates_count": len(location_analysis["source_duplicates"]),
+            },
+            "duplicates": enhanced_duplicates,
+            "location_analysis": location_analysis,
+        }
+
+        # Save to file
+        with self.scan_results_file.open("w") as f:
+            json.dump(data, f, indent=2)
+
+    def _show_scan_summary_v2(self, duplicates: dict, file_inventory: dict):
+        """Show enhanced scan summary with location-based categorization"""
+        if not duplicates:
+            self.ui.print_success("\nNo duplicates found!")
+            return
+
+        # Calculate categorized statistics
+        new_files = 0
+        backed_up_files = 0
+        source_duplicates = 0
+        total_wasted_space = 0
+
+        for paths in duplicates.values():
+            if not paths:
+                continue
+
+            file_size = paths[0].stat().st_size
+            source_count = 0
+            reference_count = 0
+
+            for file_path in paths:
+                for location_str, location_info in file_inventory["locations"].items():
+                    if str(file_path).startswith(location_str):
+                        if location_info["type"] == "source":
+                            source_count += 1
+                        elif location_info["type"] == "reference":
+                            reference_count += 1
+                        break
+
+            # Categorize this duplicate group
+            if source_count > 0 and reference_count == 0:
+                if source_count > 1:
+                    source_duplicates += source_count
+                    total_wasted_space += file_size * (source_count - 1)
+                else:
+                    new_files += 1
+            elif source_count > 0 and reference_count > 0:
+                backed_up_files += source_count
+                total_wasted_space += file_size * source_count  # All source copies are redundant
+
+        # Show categorized summary
+        self.ui.print_success("\n=== Scan Complete ===")
+        self.ui.print_info(f"Found {len(duplicates)} groups of duplicates")
+
+        if new_files > 0:
+            self.ui.print_info(f"📝 New files (need backup): {new_files}")
+        if backed_up_files > 0:
+            self.ui.print_success(f"✅ Already backed up: {backed_up_files} (can remove from sources)")
+        if source_duplicates > 0:
+            self.ui.print_warning(f"🔄 Source duplicates: {source_duplicates} (can consolidate)")
+
+        if total_wasted_space > 0:
+            self.ui.print_info(f"💾 Recoverable space: {total_wasted_space / (1024**3):.2f} GB")
+
+        self.ui.print_info("\nRun 'monosis analyze' for detailed breakdown")
+        if backed_up_files > 0 or source_duplicates > 0:
+            self.ui.print_info("Run 'monosis analyze --scope /path' to focus on specific directories")
 
     def cmd_analyze(self):
         """Analyze scan results and show detailed duplicate information"""
@@ -750,7 +1036,8 @@ Examples:
     scan_parser.add_argument("-e", "--extensions", nargs="+", help="Only scan files with these extensions")
 
     # Analyze command
-    subparsers.add_parser("analyze", help="Analyze scan results with location details")
+    analyze_parser = subparsers.add_parser("analyze", help="Analyze scan results with location details")
+    analyze_parser.add_argument("--scope", type=pathlib.Path, help="Focus analysis on specific directory")
 
     # Consolidate command
     consolidate_parser = subparsers.add_parser("consolidate", help="Consolidate unique files to target")
