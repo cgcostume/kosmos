@@ -46,6 +46,7 @@ class DuplicateDetector:
 
         # Simple in-memory cache: file_path -> hash
         self._hash_cache: dict[str, str] = {}
+        self._cache_db_path = None  # Will be set by monosis if cache exists
 
         if hash_algorithm == "md5":
             self._hash_func = hashlib.md5
@@ -72,6 +73,13 @@ class DuplicateDetector:
         if file_key in self._hash_cache:
             return self._hash_cache[file_key]
 
+        # Check database cache if available
+        if self._cache_db_path and self._cache_db_path.exists():
+            cached_hash = self._check_db_cache(file_path)
+            if cached_hash:
+                self._hash_cache[file_key] = cached_hash
+                return cached_hash
+
         # Calculate hash
         try:
             if self.hash_algorithm == "xxhash64":
@@ -94,6 +102,22 @@ class DuplicateDetector:
 
         except OSError as e:
             raise OSError(f"Cannot read file {file_path}: {e}") from e
+
+    def _check_db_cache(self, file_path: pathlib.Path) -> Optional[str]:
+        """Check if file hash exists in database cache"""
+        import sqlite3
+
+        try:
+            stat = file_path.stat()
+            with sqlite3.connect(self._cache_db_path) as conn:
+                cursor = conn.execute(
+                    "SELECT full_hash FROM file_hashes WHERE file_path = ? AND file_size = ? AND mtime = ?",
+                    (str(file_path), stat.st_size, stat.st_mtime),
+                )
+                result = cursor.fetchone()
+                return result[0] if result else None
+        except (OSError, sqlite3.Error):
+            return None
 
     def files_are_identical(self, file1: pathlib.Path, file2: pathlib.Path) -> bool:
         """Check if two files are identical
