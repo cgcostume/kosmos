@@ -19,6 +19,7 @@ class MonosisConfig:
 
     source_locations: list[str]
     target_location: Optional[str]
+    reference_location: Optional[str]
     last_scan: Optional[str]
     last_consolidation: Optional[str]
 
@@ -41,6 +42,10 @@ class MonosisConfig:
     def set_target(self, path: pathlib.Path):
         """Set target location"""
         self.target_location = str(path.resolve())
+    
+    def set_reference(self, path: pathlib.Path):
+        """Set reference location"""
+        self.reference_location = str(path.resolve())
 
     def get_source_paths(self) -> list[pathlib.Path]:
         """Get source locations as Path objects"""
@@ -49,6 +54,10 @@ class MonosisConfig:
     def get_target_path(self) -> Optional[pathlib.Path]:
         """Get target location as Path object"""
         return pathlib.Path(self.target_location) if self.target_location else None
+    
+    def get_reference_path(self) -> Optional[pathlib.Path]:
+        """Get reference location as Path object"""
+        return pathlib.Path(self.reference_location) if self.reference_location else None
 
     def update_scan_time(self):
         """Update last scan timestamp"""
@@ -68,6 +77,7 @@ class MonosisConfig:
         return cls(
             source_locations=data.get("source_locations", []),
             target_location=data.get("target_location"),
+            reference_location=data.get("reference_location"),
             last_scan=data.get("last_scan"),
             last_consolidation=data.get("last_consolidation"),
         )
@@ -78,6 +88,7 @@ class MonosisConfig:
         return cls(
             source_locations=[],
             target_location=None,
+            reference_location=None,
             last_scan=None,
             last_consolidation=None,
         )

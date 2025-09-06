@@ -50,6 +50,10 @@ class ConsoleUI:
         """Print progress message in dim white"""
         self.console.print(message, style="white dim")
 
+    def print_plain(self, message: str):
+        """Print message in plain white"""
+        self.console.print(message, style="white")
+
     def print_header(self, title: str, subtitle: Optional[str] = None):
         """Print a header with optional subtitle"""
         if subtitle:

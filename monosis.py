@@ -131,6 +131,7 @@ class Monosis:
         # Always show locations
         config["Source locations"] = self.config.source_locations if self.config.source_locations else ["undefined"]
         config["Target location"] = self.config.target_location or "undefined"
+        config["Reference location"] = self.config.reference_location or "undefined"
 
         if self.config.last_scan:
             config["Last scan"] = self.config.last_scan
@@ -167,6 +168,8 @@ class Monosis:
                 return self._locations_remove()
             if self.args.location_command == "target":
                 return self._locations_set_target()
+            if self.args.location_command == "reference":
+                return self._locations_set_reference()
             if self.args.location_command == "clear":
                 return self._locations_clear()
 
@@ -260,6 +263,39 @@ class Monosis:
 
         return True
 
+    def _locations_set_reference(self):
+        """Set reference location"""
+        path = self.args.path
+        if not path.exists():
+            self.ui.print_error(f"Path does not exist: {path}")
+            return False
+        if not path.is_dir():
+            self.ui.print_error(f"Not a directory: {path}")
+            return False
+
+        # Safety check: reference cannot be same as target or any source
+        reference_resolved = str(path.resolve())
+
+        # Check against target
+        if self.config.target_location:
+            target_path = pathlib.Path(self.config.target_location).resolve()
+            if reference_resolved == str(target_path):
+                self.ui.print_error("Reference location cannot be the same as target location")
+                return False
+
+        # Check against sources
+        for source_location in self.config.source_locations:
+            source_path = pathlib.Path(source_location).resolve()
+            if reference_resolved == str(source_path):
+                self.ui.print_error("Reference location cannot be the same as a source location")
+                return False
+
+        self.config.set_reference(path)
+        self.config_manager.save(self.config)
+        self.ui.print_success(f"Set reference location: {path.resolve()}")
+
+        return True
+
     def _locations_clear(self):
         """Clear all locations"""
         if self.ui.confirm("\nThis will clear all configured locations. Continue?"):
@@ -273,7 +309,7 @@ class Monosis:
 
     def _locations_list(self):
         """List configured locations"""
-        self.ui.print_header("Configured Locations")
+        self.ui.print_plain("Configured Locations:")
 
         if self.config.source_locations:
             self.ui.print_info("\nSource locations:")
@@ -286,6 +322,11 @@ class Monosis:
             self.ui.print_info(f"\nTarget location:\n  {self.config.target_location}")
         else:
             self.ui.print_warning("\nNo target location configured")
+
+        if self.config.reference_location:
+            self.ui.print_info(f"\nReference location (read-only):\n  {self.config.reference_location}")
+        else:
+            self.ui.print_warning("\nNo reference location configured")
 
         return True
 
@@ -654,16 +695,18 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Location-Based Workflow:
-  1. monosis locations add /path1 /path2    # Add source locations
-  2. monosis locations target /target       # Set consolidation target
-  3. monosis scan                           # Scan all locations
-  4. monosis analyze                        # Analyze duplicates
-  5. monosis consolidate                    # Copy unique files to target
-  6. monosis clean-sources --interactive    # Remove verified duplicates
+  1. monosis locations add /path1 /path2      # Add source locations
+  2. monosis locations target /target         # Set consolidation target  
+  3. monosis locations reference /backup      # Set read-only reference
+  4. monosis scan                             # Scan all locations
+  5. monosis analyze                          # Analyze duplicates
+  6. monosis consolidate --skip-referenced    # Copy unique files to target
+  7. monosis clean-sources --interactive      # Remove verified duplicates
 
 Examples:
-  monosis locations add ~/Photos ~/Documents/Pictures ~/Backup
-  monosis locations target ~/Consolidated
+  monosis locations add ~/Photos ~/Documents/Pictures
+  monosis locations target ~/Temp/Consolidated
+  monosis locations reference /mnt/backup-server
   monosis scan --recursive
   monosis analyze
   monosis consolidate --dry-run
@@ -688,6 +731,10 @@ Examples:
     # locations target
     target_parser = locations_subparsers.add_parser("target", help="Set target location")
     target_parser.add_argument("path", type=pathlib.Path, help="Directory to use as consolidation target")
+
+    # locations reference
+    reference_parser = locations_subparsers.add_parser("reference", help="Set reference location (read-only)")
+    reference_parser.add_argument("path", type=pathlib.Path, help="Directory to use as read-only reference")
 
     # locations clear
     locations_subparsers.add_parser("clear", help="Clear all locations")
