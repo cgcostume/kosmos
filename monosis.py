@@ -42,6 +42,7 @@ from rich.table import Table
 # Local imports
 from console_ui import ConsoleUI
 from duplicate_detector import DuplicateDetector
+from file_indexer import FileIndexer
 from file_operations import FileOperations
 from monosis_config import ConfigManager, MonosisConfig
 
@@ -70,6 +71,13 @@ class Monosis:
         self.cache_db = self.config_manager.get_cache_db_path()  # Shared hash cache
         self.scan_results_file = self.cache_dir / "monosis_scan_results.json"
         self.index_cache_file = self.cache_dir / "monosis_file_index.pkl"
+
+        # Initialize file indexer
+        self.file_indexer = FileIndexer(
+            cache_file=self.index_cache_file,
+            min_file_size=self.config.min_file_size,
+            ignore_patterns=self.config.ignore_patterns,
+        )
 
         # Ensure cache directory exists
         self.cache_dir.mkdir(exist_ok=True)
@@ -184,20 +192,6 @@ class Monosis:
             self.config_manager.save(self.config)
 
         return True
-
-    def _should_ignore_file(self, file_path: pathlib.Path, file_size: int) -> bool:
-        """Check if file should be ignored based on size and patterns"""
-        # Check minimum file size
-        if file_size < self.config.min_file_size:
-            return True
-
-        # Check ignore patterns
-        file_str = str(file_path)
-        for pattern in self.config.ignore_patterns:
-            if fnmatch.fnmatch(file_str, pattern) or fnmatch.fnmatch(file_path.name, pattern):
-                return True
-
-        return False
 
     def _resolve_network_path(self, path: pathlib.Path) -> Optional[pathlib.Path]:
         r"""Resolve network paths and handle Windows UNC paths like \\server\share"""
@@ -370,7 +364,17 @@ class Monosis:
         # Check if we should use cached index
         if hasattr(self.args, "use_cached_index") and self.args.use_cached_index:
             self.ui.console.print("Loading cached file index...", style="white dim")
-            file_inventory = self._load_cached_index()
+
+            # Get current locations for validation
+            current_locations = set(self.config.source_locations)
+            if self.config.reference_location:
+                current_locations.add(self.config.reference_location)
+
+            # Load cache with validation
+            file_inventory = self.file_indexer.load_cache(
+                current_locations, validation_callback=lambda msg: self.ui.console.print(msg, style="white dim")
+            )
+
             if file_inventory:
                 self.ui.print_success("Using cached file index - skipping discovery phase")
             else:
@@ -421,148 +425,43 @@ class Monosis:
             self.ui.print_error("No valid locations found")
             return {}
 
-        file_inventory = {"locations": {}, "files_by_location": defaultdict(list), "total_files": 0, "total_size": 0}
-
-        # Scan each location with progress updates
+        # Scan files with progress callbacks
         with self.ui.create_activity_progress() as progress:
             discovery_task = progress.add_task("Discovering files...", total=None)
 
-            for location_type, location_str, location_path in locations_to_scan:
-                location_files = []
-                location_size = 0
-                # pattern removed since we use os.walk or iterdir directly
-
-                # Show current location being scanned
+            # Define progress callback for file discovery
+            def progress_callback(location_str, _location_files, total_files, final=False):
                 location_display = location_str.replace(str(pathlib.Path.home()), "~")
 
-                # Scan this location using os.walk for better performance
-                if self.args.recursive:
-                    # Recursive scan using os.walk
-                    for root, _dirs, files in os.walk(location_path):
-                        for filename in files:
-                            file_path = pathlib.Path(root) / filename
+                # Calculate total size from file_inventory if available
+                total_size = sum(loc.get("size", 0) for loc in getattr(file_inventory, "locations", {}).values())
 
-                            try:
-                                stat_result = file_path.stat()
-                                file_size = stat_result.st_size
-                                file_mtime = stat_result.st_mtime
-
-                                # Apply filtering
-                                if self._should_ignore_file(file_path, file_size):
-                                    continue
-
-                                file_info = {
-                                    "path": file_path,
-                                    "size": file_size,
-                                    "mtime": file_mtime,
-                                    "location_type": location_type,
-                                    "location": location_str,
-                                }
-
-                                location_files.append(file_info)
-                                location_size += file_size
-
-                                # Update progress periodically (every 1000 files)
-                                if len(location_files) % 1000 == 0:
-                                    total_files_so_far = file_inventory["total_files"] + len(location_files)
-                                    total_size_so_far = file_inventory["total_size"] + location_size
-
-                                    # Format size for display
-                                    if total_size_so_far >= 1024**3:
-                                        size_str = f"{total_size_so_far / (1024**3):.1f} GiB"
-                                    elif total_size_so_far >= 1024**2:
-                                        size_str = f"{total_size_so_far / (1024**2):.1f} MiB"
-                                    elif total_size_so_far >= 1024:
-                                        size_str = f"{total_size_so_far / 1024:.1f} KiB"
-                                    else:
-                                        size_str = f"{total_size_so_far} B"
-
-                                    progress.update(
-                                        discovery_task,
-                                        description=f"Scanning {location_display} → {total_files_so_far:,} files, {size_str}",
-                                    )
-
-                            except OSError:
-                                continue  # Skip files we can't stat
+                # Format size for display
+                if total_size >= 1024**3:
+                    size_str = f"{total_size / (1024**3):.1f} GiB"
+                elif total_size >= 1024**2:
+                    size_str = f"{total_size / (1024**2):.1f} MiB"
+                elif total_size >= 1024:
+                    size_str = f"{total_size / 1024:.1f} KiB"
                 else:
-                    # Non-recursive scan - just list files in the directory
-                    try:
-                        for item in location_path.iterdir():
-                            if not item.is_file():
-                                continue
+                    size_str = f"{total_size} B"
 
-                            try:
-                                stat_result = item.stat()
-                                file_size = stat_result.st_size
-                                file_mtime = stat_result.st_mtime
-
-                                # Apply filtering
-                                if self._should_ignore_file(item, file_size):
-                                    continue
-
-                                file_info = {
-                                    "path": item,
-                                    "size": file_size,
-                                    "mtime": file_mtime,
-                                    "location_type": location_type,
-                                    "location": location_str,
-                                }
-
-                                location_files.append(file_info)
-                                location_size += file_size
-
-                                # Update progress periodically (every 1000 files)
-                                if len(location_files) % 1000 == 0:
-                                    total_files_so_far = file_inventory["total_files"] + len(location_files)
-                                    total_size_so_far = file_inventory["total_size"] + location_size
-
-                                    # Format size for display
-                                    if total_size_so_far >= 1024**3:
-                                        size_str = f"{total_size_so_far / (1024**3):.1f} GiB"
-                                    elif total_size_so_far >= 1024**2:
-                                        size_str = f"{total_size_so_far / (1024**2):.1f} MiB"
-                                    elif total_size_so_far >= 1024:
-                                        size_str = f"{total_size_so_far / 1024:.1f} KiB"
-                                    else:
-                                        size_str = f"{total_size_so_far} B"
-
-                                    progress.update(
-                                        discovery_task,
-                                        description=f"Scanning {location_display} → {total_files_so_far:,} files, {size_str}",
-                                    )
-
-                            except OSError:
-                                continue  # Skip files we can't stat
-                    except OSError:
-                        self.ui.print_warning(f"Cannot access directory: {location_path}")
-
-                # Store location info
-                file_inventory["locations"][location_str] = {
-                    "type": location_type,
-                    "files": location_files,
-                    "count": len(location_files),
-                    "size": location_size,
-                }
-
-                file_inventory["files_by_location"][location_str] = location_files
-                file_inventory["total_files"] += len(location_files)
-                file_inventory["total_size"] += location_size
-
-                # Final update for this location
-                total_size_gib = file_inventory["total_size"] / (1024**3)
-                if total_size_gib >= 1:
-                    size_str = f"{total_size_gib:.1f} GiB"
-                elif file_inventory["total_size"] >= 1024**2:
-                    size_str = f"{file_inventory['total_size'] / (1024**2):.1f} MiB"
-                elif file_inventory["total_size"] >= 1024:
-                    size_str = f"{file_inventory['total_size'] / 1024:.1f} KiB"
+                if final:
+                    progress.update(
+                        discovery_task,
+                        description=f"Completed {location_display} → Total: {total_files:,} files, {size_str}",
+                    )
                 else:
-                    size_str = f"{file_inventory['total_size']} B"
+                    progress.update(
+                        discovery_task,
+                        description=f"Scanning {location_display} → {total_files:,} files, {size_str}",
+                    )
 
-                progress.update(
-                    discovery_task,
-                    description=f"Completed {location_display} → Total: {file_inventory['total_files']:,} files, {size_str}",
-                )
+            # Set progress callback
+            self.file_indexer.progress_callback = progress_callback
+
+            # Discover files
+            file_inventory = self.file_indexer.discover_files(locations_to_scan, recursive=self.args.recursive)
 
         # Show discovery summary in table format
 
@@ -593,7 +492,7 @@ class Monosis:
 
         # Cache the file inventory for future use
         self.ui.console.print("\nCaching file index for future scans...", style="white dim")
-        self._save_file_index_cache(file_inventory)
+        self.file_indexer.save_cache(file_inventory)
 
         return file_inventory
 
@@ -647,8 +546,8 @@ class Monosis:
         completed_files = 0
         file_hashes = {}  # Thread-safe dict for results
 
-        def hash_single_file(file_path: pathlib.Path) -> tuple[pathlib.Path, Optional[str]]:
-            """Hash a single file and return (path, hash)"""
+        def hash_single_file(file_path: pathlib.Path) -> tuple[pathlib.Path, Optional[str], bool]:
+            """Hash a single file and return (path, hash, was_cached)"""
             try:
                 # Check database cache first
                 cached_hash = None
@@ -656,12 +555,13 @@ class Monosis:
                     cached_hash = self.duplicate_detector._check_db_cache(file_path)
 
                 if cached_hash:
-                    return (file_path, cached_hash)
+                    return (file_path, cached_hash, True)
+
                 # Calculate hash
                 file_hash = self.duplicate_detector.calculate_file_hash(file_path)
-                return (file_path, file_hash)
+                return (file_path, file_hash, False)
             except Exception:
-                return (file_path, None)
+                return (file_path, None, False)
 
         # Start parallel hashing
         with self.ui.create_progress() as progress:
@@ -675,21 +575,14 @@ class Monosis:
 
                 # Process completed hashes as they finish
                 for future in as_completed(future_to_file):
-                    file_path, file_hash = future.result()
+                    file_path, file_hash, was_cached = future.result()
 
                     with progress_lock:
                         completed_files += 1
 
                         if file_hash:
-                            # Check if this was a cache hit
-                            if (
-                                self.duplicate_detector._cache_db_path
-                                and self.duplicate_detector._cache_db_path.exists()
-                                and (
-                                    str(file_path) in self.duplicate_detector._hash_cache
-                                    or self.duplicate_detector._check_db_cache(file_path)
-                                )
-                            ):
+                            # Track cache hits
+                            if was_cached:
                                 total_db_cache_hits += 1
 
                             # Store hash
@@ -1007,26 +900,19 @@ class Monosis:
             self.ui.console.print("  No cache database found", style="white dim")
 
         # Check file index cache
-        if self.index_cache_file.exists():
-            try:
-                with self.index_cache_file.open("rb") as f:
-                    index_data = pickle.load(f)
-                    total_cached_files = sum(
-                        len(loc.get("files", [])) for loc in index_data.get("locations", {}).values()
-                    )
-                    cache_timestamp = index_data.get("timestamp", "Unknown")
-                    # Format timestamp for display
-                    if cache_timestamp != "Unknown":
-                        try:
-                            dt = datetime.fromisoformat(cache_timestamp.replace("Z", "+00:00"))
-                            cache_timestamp = dt.strftime("%Y-%m-%d %H:%M:%S")
-                        except (ValueError, AttributeError):
-                            pass
-                    self.ui.console.print(
-                        f"  Indexed files: {total_cached_files:,} (from {cache_timestamp})", style="white dim"
-                    )
-            except (pickle.UnpicklingError, KeyError, EOFError):
-                self.ui.console.print("  File index corrupted", style="white dim")
+        cache_stats = self.file_indexer.get_cache_stats()
+        if cache_stats:
+            # Format timestamp for display
+            cache_timestamp = cache_stats.get("timestamp", "Unknown")
+            if cache_timestamp != "Unknown":
+                try:
+                    dt = datetime.fromisoformat(cache_timestamp.replace("Z", "+00:00"))
+                    cache_timestamp = dt.strftime("%Y-%m-%d %H:%M:%S")
+                except (ValueError, AttributeError):
+                    pass
+            self.ui.console.print(
+                f"  Indexed files: {cache_stats['total_files']:,} (from {cache_timestamp})", style="white dim"
+            )
         else:
             self.ui.console.print("  Indexed files: 0", style="white dim")
 
@@ -1084,8 +970,7 @@ class Monosis:
                 self.ui.print_success("Scan results deleted")
                 results_deleted = True
 
-            if self.index_cache_file.exists():
-                self.index_cache_file.unlink()
+            if self.file_indexer.clear_cache():
                 self.ui.print_success("File index cache deleted")
                 cache_deleted = True
 
@@ -1134,26 +1019,17 @@ class Monosis:
 
     def _clean_index_only(self):
         """Clean only the file index cache"""
-        if self.index_cache_file.exists():
-            try:
-                with self.index_cache_file.open("rb") as f:
-                    index_data = pickle.load(f)
-                    total_cached_files = sum(
-                        len(loc.get("files", [])) for loc in index_data.get("locations", {}).values()
-                    )
-                    if self.ui.confirm(
-                        f"\nThis will delete the file index cache ({total_cached_files:,} files). Continue?"
-                    ):
-                        self.index_cache_file.unlink()
-                        self.ui.print_success("File index cache deleted")
-                    else:
-                        self.ui.print_info("Index cache clean cancelled")
-            except (pickle.UnpicklingError, KeyError, EOFError):
-                if self.ui.confirm("\nThis will delete the corrupted file index cache. Continue?"):
-                    self.index_cache_file.unlink()
-                    self.ui.print_success("Corrupted file index cache deleted")
+        cache_stats = self.file_indexer.get_cache_stats()
+        if cache_stats:
+            if self.ui.confirm(
+                f"\nThis will delete the file index cache ({cache_stats['total_files']:,} files). Continue?"
+            ):
+                if self.file_indexer.clear_cache():
+                    self.ui.print_success("File index cache deleted")
                 else:
-                    self.ui.print_info("Index cache clean cancelled")
+                    self.ui.print_error("Failed to delete file index cache")
+            else:
+                self.ui.print_info("Index cache clean cancelled")
         else:
             self.ui.print_info("No file index cache found")
 
@@ -1171,8 +1047,9 @@ class Monosis:
             total_size += cache_size
 
         # Check index cache
-        if self.index_cache_file.exists():
-            index_size = self.index_cache_file.stat().st_size
+        cache_stats = self.file_indexer.get_cache_stats()
+        if cache_stats:
+            index_size = cache_stats["size"]
             files_to_clean.append(("file index cache", index_size))
             total_size += index_size
 
@@ -1208,12 +1085,8 @@ class Monosis:
                     self.ui.print_error("Cannot delete hash cache - it may be in use by another process")
 
             # Clean index cache
-            if self.index_cache_file.exists():
-                try:
-                    self.index_cache_file.unlink()
-                    deleted_files.append("file index cache")
-                except PermissionError:
-                    self.ui.print_error("Cannot delete file index cache - it may be in use")
+            if self.file_indexer.clear_cache():
+                deleted_files.append("file index cache")
 
             if deleted_files:
                 self.ui.print_success(f"Deleted: {', '.join(deleted_files)}")
@@ -1488,109 +1361,6 @@ class Monosis:
         self.ui.console.print(f"Total duplicate size: {total_size / (1024**3):.2f} GB")
         if safe_to_delete:
             self.ui.console.print(f"Safe to reclaim: {safe_size / (1024**3):.2f} GB", style="green")
-
-    def _save_file_index_cache(self, file_inventory: dict):
-        """Save file index to cache for future scans"""
-        cache_data = {"timestamp": datetime.now(timezone.utc).isoformat(), "locations": {}}
-
-        for location_str, location_info in file_inventory["locations"].items():
-            try:
-                location_path = pathlib.Path(location_str)
-                # Get directory modification time for invalidation
-                dir_mtime = location_path.stat().st_mtime if location_path.exists() else 0
-
-                cache_data["locations"][location_str] = {
-                    "type": location_info["type"],
-                    "dir_mtime": dir_mtime,
-                    "cached_at": cache_data["timestamp"],
-                    "files": [
-                        {
-                            "path": str(file_info["path"]),
-                            "size": file_info["size"],
-                            "mtime": file_info["mtime"],
-                            "location_type": file_info["location_type"],
-                            "location": file_info["location"],
-                        }
-                        for file_info in location_info["files"]
-                    ],
-                }
-            except (OSError, KeyError):
-                continue  # Skip problematic locations
-
-        # Save cache to file
-        try:
-            with self.index_cache_file.open("wb") as f:
-                pickle.dump(cache_data, f, protocol=pickle.HIGHEST_PROTOCOL)
-        except OSError:
-            # Cache save failed, but don't crash the scan
-            pass
-
-    def _load_cached_index(self) -> dict:
-        """Load file index from cache if valid"""
-        if not self.index_cache_file.exists():
-            return {}
-
-        try:
-            with self.index_cache_file.open("rb") as f:
-                cache_data = pickle.load(f)
-        except (pickle.UnpicklingError, OSError, EOFError):
-            return {}
-
-        # Check if current locations match cached locations
-        current_locations = set(self.config.source_locations)
-        if self.config.reference_location:
-            current_locations.add(self.config.reference_location)
-
-        cached_locations = set(cache_data.get("locations", {}).keys())
-        if current_locations != cached_locations:
-            self.ui.console.print("Location configuration changed, cache invalid", style="white dim")
-            return {}
-
-        # Validate each location's modification time
-        file_inventory = {"locations": {}, "files_by_location": defaultdict(list), "total_files": 0, "total_size": 0}
-
-        for location_str, cached_location in cache_data["locations"].items():
-            try:
-                location_path = pathlib.Path(location_str)
-                current_mtime = location_path.stat().st_mtime if location_path.exists() else 0
-                cached_mtime = cached_location.get("dir_mtime", 0)
-
-                # Allow small time differences (file system precision)
-                if abs(current_mtime - cached_mtime) > 1.0:
-                    self.ui.console.print(f"Directory changed: {location_str}, cache invalid", style="white dim")
-                    return {}
-
-                # Reconstruct file inventory from cache
-                location_files = []
-                location_size = 0
-
-                for cached_file in cached_location["files"]:
-                    file_info = {
-                        "path": pathlib.Path(cached_file["path"]),
-                        "size": cached_file["size"],
-                        "mtime": cached_file["mtime"],
-                        "location_type": cached_file["location_type"],
-                        "location": cached_file["location"],
-                    }
-                    location_files.append(file_info)
-                    location_size += cached_file["size"]
-
-                file_inventory["locations"][location_str] = {
-                    "type": cached_location["type"],
-                    "files": location_files,
-                    "count": len(location_files),
-                    "size": location_size,
-                }
-
-                file_inventory["files_by_location"][location_str] = location_files
-                file_inventory["total_files"] += len(location_files)
-                file_inventory["total_size"] += location_size
-
-            except (OSError, KeyError, ValueError):
-                # If any location fails validation, invalidate entire cache
-                return {}
-
-        return file_inventory
 
     def _cache_batch_hashes(self, file_paths: list[pathlib.Path], duplicates: dict):
         """Cache hashes for a batch of files to SQLite database"""

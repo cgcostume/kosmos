@@ -103,9 +103,8 @@ class DuplicateDetector:
             # Store in memory cache
             self._hash_cache[file_key] = file_hash
 
-            # Store in database cache if available
-            if self._cache_db_path and self._cache_db_path.exists():
-                self._save_to_db_cache(file_path, file_hash)
+            # Note: Database caching is handled in batch by the calling code
+            # to avoid performance issues with individual SQLite connections
 
             return file_hash
 
