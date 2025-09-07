@@ -7,18 +7,18 @@ to their essential singular form. Designed to handle hundreds of thousands of
 files efficiently with multi-stage processing and intelligent caching.
 
 Features:
-- Location-based management (multiple sources, single target)
+- Location-based management (multiple sources, target, reference)
 - Multi-stage hashing pipeline for performance
-- Persistent caching between runs
-- Safe consolidation with copy-only operations
-- Zero data loss guarantee with explicit approval for deletions
+- Persistent caching between runs with shared .kosmos infrastructure
+- Intelligent file filtering (size, patterns)
+- Check specific paths for duplicates
 
 Workflow:
-1. locations - Configure source and target directories
-2. scan      - Analyze configured locations for duplicates
-3. analyze   - Show duplicate groups (within and across locations)
-4. consolidate - Copy unique files to target location
-5. clean-sources - Remove verified duplicates from sources (with approval)
+1. locations - Configure source, target, and reference directories
+2. scan      - Build hash index of configured locations
+3. check     - Check specific paths for duplicates
+4. status    - View configuration and cache statistics
+5. clean     - Clean cache files (index, hashes, or both)
 """
 
 import argparse
@@ -34,7 +34,6 @@ import threading
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -43,7 +42,7 @@ from rich.table import Table
 # Local imports
 from console_ui import ConsoleUI
 from duplicate_detector import DuplicateDetector
-from file_operations import FileOperations, OperationType
+from file_operations import FileOperations
 from monosis_config import ConfigManager, MonosisConfig
 
 # Fix Windows console encoding for Unicode characters
@@ -51,41 +50,6 @@ if sys.platform == "win32":
     import io
 
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
-
-
-@dataclass
-class DuplicateGroup:
-    """Information about a group of duplicate files"""
-
-    hash_value: str
-    file_paths: list[pathlib.Path]
-    file_size: int
-    total_size: int
-    wasted_space: int
-    locations: set[str] = field(default_factory=set)  # Which source locations contain this file
-
-    @property
-    def count(self) -> int:
-        return len(self.file_paths)
-
-    @property
-    def is_cross_location(self) -> bool:
-        """True if duplicates exist across multiple locations"""
-        return len(self.locations) > 1
-
-
-@dataclass
-class LocationStats:
-    """Statistics for a source location"""
-
-    path: pathlib.Path
-    total_files: int = 0
-    unique_files: int = 0
-    duplicate_files: int = 0
-    within_location_duplicates: int = 0
-    cross_location_duplicates: int = 0
-    total_size: int = 0
-    wasted_space: int = 0
 
 
 class Monosis:
@@ -150,9 +114,6 @@ class Monosis:
                 config["Recursive"] = "Yes" if self.args.recursive else "No"
                 config["Use cache"] = "Yes" if not self.args.no_cache else "No"
 
-            elif self.args.command == "consolidate":
-                config["Dry run"] = "Yes" if self.args.dry_run else "No"
-                config["Interactive"] = "Yes" if self.args.interactive else "No"
                 if hasattr(self.args, "strategy"):
                     config["Strategy"] = self.args.strategy
 
@@ -956,7 +917,7 @@ class Monosis:
         if backed_up_files > 0:
             self.ui.print_success(f"✅ Already backed up: {backed_up_files} (can remove from sources)")
         if source_duplicates > 0:
-            self.ui.print_warning(f"🔄 Source duplicates: {source_duplicates} (can consolidate)")
+            self.ui.print_warning(f"🔄 Source duplicates: {source_duplicates}")
 
         if total_wasted_space > 0:
             self.ui.print_info(f"💾 Recoverable space: {total_wasted_space / (1024**3):.2f} GB")
@@ -1017,106 +978,6 @@ class Monosis:
 
         # Display results with categorization
         self._display_check_results(duplicates_found, check_path)
-
-        return True
-
-    def cmd_analyze(self):
-        """Analyze scan results and show detailed duplicate information"""
-        # Load scan results
-        if not self.scan_results_file.exists():
-            self.ui.print_error("No scan results found. Run 'monosis scan' first.")
-            return False
-
-        with self.scan_results_file.open() as f:
-            data = json.load(f)
-
-        self.ui.print_header("Duplicate Analysis", f"Scan performed: {data['timestamp']}")
-
-        # Calculate location-based statistics
-        location_stats = self._analyze_location_stats(data)
-
-        # Show location statistics
-        self.ui.print_info("\n=== Location Statistics ===")
-        for location, stats in location_stats.items():
-            self.ui.print_info(f"\n{location}:")
-            self.ui.console.print(f"  Total files: {stats['total_files']}")
-            self.ui.console.print(f"  Unique files: {stats['unique_files']}")
-            self.ui.console.print(f"  Within-location duplicates: {stats['within_duplicates']}")
-            self.ui.console.print(f"  Cross-location duplicates: {stats['cross_duplicates']}")
-            self.ui.console.print(f"  Wasted space: {stats['wasted_space_gb']:.2f} GB")
-
-        # Show duplicate groups
-        self.ui.print_info("\n=== Duplicate Groups ===")
-        duplicate_groups = data["duplicates"]
-
-        # Sort by wasted space
-        sorted_groups = sorted(
-            duplicate_groups.items(),
-            key=lambda x: len(x[1]) * pathlib.Path(x[1][0]).stat().st_size if x[1] else 0,
-            reverse=True,
-        )
-
-        # Show top 10 duplicate groups
-        for i, (_hash_val, file_paths) in enumerate(sorted_groups[:10], 1):
-            if file_paths:
-                file_size = pathlib.Path(file_paths[0]).stat().st_size
-                wasted = file_size * (len(file_paths) - 1)
-
-                self.ui.console.print(f"\n{i}. {len(file_paths)} copies, {wasted / (1024**3):.2f} GB wasted")
-
-                # Group by location
-                by_location = defaultdict(list)
-                for fp in file_paths:
-                    for location in self.config.source_locations:
-                        if fp.startswith(location):
-                            by_location[location].append(fp)
-                            break
-
-                for location, paths in by_location.items():
-                    self.ui.console.print(f"  {location}: {len(paths)} copies")
-
-        self.ui.print_info("\nRun 'monosis consolidate' to copy unique files to target location")
-
-        return True
-
-    def cmd_consolidate(self):
-        """Consolidate unique files to target location"""
-        # Check configuration
-        if not self.config.target_location:
-            self.ui.print_error("No target location configured. Use 'monosis locations target' first.")
-            return False
-
-        # Load scan results
-        if not self.scan_results_file.exists():
-            self.ui.print_error("No scan results found. Run 'monosis scan' first.")
-            return False
-
-        self.ui.print_info("Consolidation functionality coming soon...")
-
-        # TODO: Implement consolidation logic
-        # 1. Build list of unique files (one per hash)
-        # 2. Choose best source for each (most metadata, newest, etc.)
-        # 3. Copy to target maintaining directory structure
-        # 4. Verify copies
-        # 5. Update consolidation timestamp
-
-        return True
-
-    def cmd_clean_sources(self):
-        """Clean verified duplicates from source locations"""
-        # Safety checks
-        if not self.config.last_consolidation:
-            self.ui.print_error("No consolidation has been performed. Run 'monosis consolidate' first.")
-            return False
-
-        self.ui.print_info("Source cleaning functionality coming soon...")
-
-        # TODO: Implement source cleaning logic
-        # 1. Verify all files exist in target
-        # 2. Show exact files to be deleted
-        # 3. Require explicit confirmation
-        # 4. Create deletion log
-        # 5. Delete files
 
         return True
 
@@ -1451,53 +1312,6 @@ class Monosis:
         self.ui.print_info(f"  Cross-location groups: {cross_location_count}")
         self.ui.print_info(f"Total duplicate files: {total_files}")
         self.ui.print_info(f"Wasted space: {wasted_space / (1024**3):.2f} GB")
-
-        self.ui.print_info("\nRun 'monosis analyze' for detailed analysis")
-
-    def _analyze_location_stats(self, data: dict) -> dict:
-        """Analyze statistics per location"""
-        stats = {}
-
-        for location in data["source_locations"]:
-            stats[location] = {
-                "total_files": 0,
-                "unique_files": 0,
-                "within_duplicates": 0,
-                "cross_duplicates": 0,
-                "wasted_space_gb": 0.0,
-            }
-
-        # Process duplicate groups
-        for _hash_val, group_data in data["duplicates"].items():
-            files = group_data["files"]
-
-            if files:
-                file_size = pathlib.Path(files[0]).stat().st_size
-
-                # Count files per location
-                for file_path in files:
-                    for location in data["source_locations"]:
-                        if file_path.startswith(location):
-                            stats[location]["total_files"] += 1
-
-                            if group_data["is_cross_location"]:
-                                stats[location]["cross_duplicates"] += 1
-                            else:
-                                stats[location]["within_duplicates"] += 1
-
-                            # Add wasted space (except for first copy)
-                            location_count = sum(1 for f in files if f.startswith(location))
-                            if location_count > 1:
-                                stats[location]["wasted_space_gb"] += (location_count - 1) * file_size / (1024**3)
-                            break
-
-        # Calculate unique files
-        for _location, location_stats in stats.items():
-            total = location_stats["total_files"]
-            dups = location_stats["within_duplicates"] + location_stats["cross_duplicates"]
-            location_stats["unique_files"] = total - dups
-
-        return stats
 
     def _find_duplicates_for_files(self, files_to_check: list[pathlib.Path], check_path: pathlib.Path) -> dict:
         """Find duplicates for specified files by querying hash database"""
@@ -1842,8 +1656,7 @@ Location-Based Workflow:
   2. monosis locations target /target         # Set consolidation target  
   3. monosis locations reference /backup      # Set read-only reference
   4. monosis scan                             # Scan all locations
-  5. monosis analyze                          # Analyze duplicates
-  6. monosis consolidate --skip-referenced    # Copy unique files to target
+  5. monosis check /path/to/check             # Check specific path for duplicates
   7. monosis clean-sources --interactive      # Remove verified duplicates
 
 Examples:
@@ -1851,8 +1664,7 @@ Examples:
   monosis locations target ~/Temp/Consolidated
   monosis locations reference /mnt/backup-server
   monosis scan --recursive
-  monosis analyze
-  monosis consolidate --dry-run
+  monosis check ~/Downloads --external-only
   monosis status
         """,
     )
@@ -1901,27 +1713,6 @@ Examples:
     check_parser.add_argument("--external-only", action="store_true", help="Only show duplicates outside checked path")
     check_parser.add_argument("--min-size", type=int, help="Minimum file size in bytes to check")
 
-    # Analyze command
-    subparsers.add_parser("analyze", help="Analyze scan results with location details")
-
-    # Consolidate command
-    consolidate_parser = subparsers.add_parser("consolidate", help="Consolidate unique files to target")
-    consolidate_parser.add_argument(
-        "--interactive", action="store_true", help="Interactive mode for conflict resolution"
-    )
-    consolidate_parser.add_argument(
-        "--strategy",
-        choices=["newest", "oldest", "largest", "most-metadata"],
-        default="newest",
-        help="Auto-resolution strategy",
-    )
-    consolidate_parser.add_argument("--dry-run", action="store_true", help="Show what would be done without copying")
-
-    # Clean sources command
-    clean_parser = subparsers.add_parser("clean-sources", help="Remove verified duplicates from sources")
-    clean_parser.add_argument("--dry-run", action="store_true", help="Show what would be deleted without removing")
-    clean_parser.add_argument("--interactive", action="store_true", help="Confirm each deletion individually")
-
     # Status command
     subparsers.add_parser("status", help="Show configuration and statistics")
 
@@ -1952,18 +1743,6 @@ Examples:
     elif args.command == "check":
         # Check doesn't need configuration display
         success = app.cmd_check()
-    elif args.command == "analyze":
-        # Show configuration first for analyze
-        app.show_configuration()
-        success = app.cmd_analyze()
-    elif args.command == "consolidate":
-        # Show configuration first for consolidate
-        app.show_configuration()
-        success = app.cmd_consolidate()
-    elif args.command == "clean-sources":
-        # Show configuration first for clean-sources
-        app.show_configuration()
-        success = app.cmd_clean_sources()
     elif args.command == "status":
         # Status shows its own info, no configuration needed
         success = app.cmd_status()
