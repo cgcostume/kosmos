@@ -2,15 +2,19 @@
 """
 Configuration management for Monosis
 
-Handles persistent storage of source locations, target location,
-and other configuration settings.
+Wrapper around shared kosmos configuration for monosis-specific settings.
+Maintains backward compatibility while using shared infrastructure.
 """
 
 import json
+import os
 import pathlib
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import Optional
+
+# Use shared kosmos configuration
+from kosmos_config import SharedConfigManager, init_shared_cache_db
 
 
 @dataclass
@@ -22,6 +26,9 @@ class MonosisConfig:
     reference_location: Optional[str]
     last_scan: Optional[str]
     last_consolidation: Optional[str]
+    min_file_size: int  # Minimum file size in bytes
+    ignore_patterns: list[str]  # Glob patterns to ignore
+    max_workers: int  # Maximum number of parallel hashing threads
 
     def add_source(self, path: pathlib.Path) -> bool:
         """Add a source location"""
@@ -42,7 +49,7 @@ class MonosisConfig:
     def set_target(self, path: pathlib.Path):
         """Set target location"""
         self.target_location = str(path.resolve())
-    
+
     def set_reference(self, path: pathlib.Path):
         """Set reference location"""
         self.reference_location = str(path.resolve())
@@ -54,7 +61,7 @@ class MonosisConfig:
     def get_target_path(self) -> Optional[pathlib.Path]:
         """Get target location as Path object"""
         return pathlib.Path(self.target_location) if self.target_location else None
-    
+
     def get_reference_path(self) -> Optional[pathlib.Path]:
         """Get reference location as Path object"""
         return pathlib.Path(self.reference_location) if self.reference_location else None
@@ -80,7 +87,37 @@ class MonosisConfig:
             reference_location=data.get("reference_location"),
             last_scan=data.get("last_scan"),
             last_consolidation=data.get("last_consolidation"),
+            min_file_size=data.get("min_file_size", 1024),  # Default 1KB
+            ignore_patterns=data.get("ignore_patterns", cls._default_ignore_patterns()),
+            max_workers=data.get("max_workers", min(32, (os.cpu_count() or 1) + 4)),  # Default based on CPU cores
         )
+
+    @classmethod
+    def _default_ignore_patterns(cls) -> list[str]:
+        """Get default ignore patterns"""
+        return [
+            # System files
+            "Thumbs.db",
+            ".DS_Store",
+            "desktop.ini",
+            "Icon\r",  # macOS custom icons
+            # Development
+            "node_modules/**",
+            "__pycache__/**",
+            "*.pyc",
+            ".pytest_cache/**",
+            # Temporary files
+            "*.tmp",
+            "*.temp",
+            "~*",  # Office temp files
+            ".~*",  # LibreOffice temp files
+            # Cache files
+            ".cache/**",
+            "*.cache",
+            # Browser cache/temp
+            "*/Cache/**",
+            "*/cache/**",
+        ]
 
     @classmethod
     def default(cls) -> "MonosisConfig":
@@ -91,33 +128,57 @@ class MonosisConfig:
             reference_location=None,
             last_scan=None,
             last_consolidation=None,
+            min_file_size=1024,  # 1KB minimum
+            ignore_patterns=cls._default_ignore_patterns(),
+            max_workers=min(32, (os.cpu_count() or 1) + 4),  # Default based on CPU cores
         )
 
 
 class ConfigManager:
-    """Manages loading and saving configuration"""
+    """Manages loading and saving configuration using shared kosmos infrastructure"""
 
-    def __init__(self, config_dir: pathlib.Path):
-        self.config_dir = config_dir
-        self.config_file = config_dir / "config.json"
-        self.config_dir.mkdir(exist_ok=True)
+    def __init__(self, config_dir: Optional[pathlib.Path] = None):
+        """Initialize configuration manager
+
+        Args:
+            config_dir: Ignored - kept for backward compatibility. Uses .kosmos now.
+        """
+        # Use shared config manager
+        self.shared_manager = SharedConfigManager()
+        self.config_dir = self.shared_manager.kosmos_dir  # For compatibility
+        self.config_file = self.shared_manager.config_file  # For compatibility
+        
+        # Initialize shared cache database
+        init_shared_cache_db(self.shared_manager.get_cache_db_path())
+        
+        # Migrate old monosis config if exists
+        self.shared_manager.migrate_from_monosis()
 
     def load(self) -> MonosisConfig:
-        """Load configuration from file"""
-        if self.config_file.exists():
-            try:
-                with self.config_file.open() as f:
-                    data = json.load(f)
-                    return MonosisConfig.from_dict(data)
-            except (json.JSONDecodeError, KeyError):
-                # If config is corrupted, return default
-                return MonosisConfig.default()
-        return MonosisConfig.default()
+        """Load configuration from shared kosmos config"""
+        kosmos_config = self.shared_manager.load()
+        
+        # Get monosis-specific config
+        monosis_data = kosmos_config.monosis
+        
+        if monosis_data:
+            return MonosisConfig.from_dict(monosis_data)
+        else:
+            return MonosisConfig.default()
 
     def save(self, config: MonosisConfig):
-        """Save configuration to file"""
-        with self.config_file.open("w") as f:
-            json.dump(config.to_dict(), f, indent=2)
+        """Save configuration to shared kosmos config"""
+        kosmos_config = self.shared_manager.load()
+        
+        # Update monosis section
+        kosmos_config.monosis = config.to_dict()
+        
+        # Save back to shared config
+        self.shared_manager.save(kosmos_config)
+    
+    def get_cache_db_path(self) -> pathlib.Path:
+        """Get path to shared hash cache database"""
+        return self.shared_manager.get_cache_db_path()
 
     def reset(self):
         """Reset configuration to default"""

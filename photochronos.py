@@ -33,6 +33,7 @@ from console_ui import ConsoleUI
 from duplicate_detector import DuplicateDetector
 from file_analyzer import FileAnalysisResult, FileAnalyzer
 from file_operations import FileOperations, OperationType
+from kosmos_config import SharedConfigManager, init_shared_cache_db
 
 # Fix Windows console encoding for Unicode characters
 if sys.platform == "win32":
@@ -120,8 +121,19 @@ class PhotoChronos:
         self.duplicates: dict[str, list[FileInfo]] = defaultdict(list)
         self.issues: list[str] = []
 
-        # Initialize duplicate detector with in-memory caching
-        self.duplicate_detector = DuplicateDetector(hash_algorithm="md5", chunk_size=65536)
+        # Initialize duplicate detector with xxHash64 and shared cache
+        # Initialize shared config and cache
+        self.shared_config = SharedConfigManager()
+        cache_db_path = self.shared_config.get_cache_db_path()
+        init_shared_cache_db(cache_db_path)
+
+        # Use xxHash64 for better performance (backward compatible - will rehash if needed)
+        self.duplicate_detector = DuplicateDetector(
+            hash_algorithm="xxhash64", chunk_size=65536, tool_name="photochronos"
+        )
+
+        # Set the shared cache path
+        self.duplicate_detector._cache_db_path = cache_db_path
 
         # Initialize file analyzer
         self.file_analyzer = FileAnalyzer()
@@ -260,7 +272,9 @@ class PhotoChronos:
                         path=file_path,
                         original_name=file_path.name,
                         file_size=0,
-                        date_created=datetime.datetime.fromtimestamp(file_path.stat().st_mtime),
+                        date_created=datetime.datetime.fromtimestamp(
+                            file_path.stat().st_mtime, tz=datetime.timezone.utc
+                        ),
                         file_type="unknown",
                     )
                     file_info.issues.append(f"Analysis failed: {e}")
@@ -307,11 +321,12 @@ class PhotoChronos:
                     return
 
         # Check 3: EXIF completeness (no camera info = likely external)
-        if not file_info.camera_make and not file_info.camera_model:
-            if file_info.exif_completeness < 0.4:  # Less than 40% of expected tags
-                file_info.is_external = True
-                file_info.external_reason = "Minimal EXIF data (likely downloaded/shared)"
-                return
+        if (
+            not file_info.camera_make and not file_info.camera_model and file_info.exif_completeness < 0.4
+        ):  # Less than 40% of expected tags
+            file_info.is_external = True
+            file_info.external_reason = "Minimal EXIF data (likely downloaded/shared)"
+            return
 
     def show_issues_report(self, files: list[FileInfo]):
         """Show summary of issues encountered during analysis"""
@@ -345,7 +360,6 @@ class PhotoChronos:
         date = file_info.date_created
         extension = file_info.path.suffix.lower()
 
-        # Format: YYYYMMDD_HHMMSS.ext
         base_name = date.strftime("%Y%m%d_%H%M%S")
         return f"{base_name}{extension}"
 
@@ -449,7 +463,7 @@ class PhotoChronos:
             target_name_groups[target_name].append(file_info)
 
         # Only check duplicates within groups that would conflict (efficient)
-        for target_name, file_group in target_name_groups.items():
+        for _target_name, file_group in target_name_groups.items():
             if len(file_group) > 1:
                 # Sort by path for consistent ordering
                 file_group.sort(key=lambda f: str(f.path))
@@ -475,13 +489,10 @@ class PhotoChronos:
     def _check_for_duplicate(self, file_info: FileInfo, target_path: pathlib.Path) -> bool:
         """Check if file is duplicate and mark it if so. Returns True if duplicate."""
         # If already marked as duplicate by comprehensive check, respect that
-        if file_info.is_duplicate:
-            return True
-
         # CRITICAL: Do NOT check duplicates during planning phase
         # All duplicate detection should happen in _detect_content_duplicates
         # This prevents symmetric duplicate marking bugs
-        return False
+        return file_info.is_duplicate
 
     def plan_renames(self, files: list[FileInfo]) -> dict[str, FileInfo]:
         """Plan renames with conflict resolution"""
@@ -529,10 +540,12 @@ class PhotoChronos:
                 target_path_str = str(target_path)
 
                 # Only add operation if there's an actual change needed
-                if current_path_str != target_path_str and not file_info.is_duplicate:
-                    # Double-check: don't add if only difference is case or whitespace
-                    if file_info.path.name != target_path.name or file_info.path.parent != target_path.parent:
-                        planned_operations[current_path_str] = file_info
+                if (
+                    current_path_str != target_path_str
+                    and not file_info.is_duplicate
+                    and (file_info.path.name != target_path.name or file_info.path.parent != target_path.parent)
+                ):
+                    planned_operations[current_path_str] = file_info
 
                 progress.update(task, advance=1)
 
@@ -621,9 +634,9 @@ class PhotoChronos:
         for file_info in duplicates:
             by_directory[str(file_info.path.parent)].append(file_info)
 
-        for directory, files in sorted(by_directory.items()):
+        for directory, dir_files in sorted(by_directory.items()):
             self.ui.print_warning(f"  Directory: {directory}")
-            for file_info in files:
+            for file_info in dir_files:
                 self.ui.console.print(
                     f"    {file_info.original_name} (duplicate of {file_info.duplicate_of.name})", style="yellow dim"
                 )
@@ -776,7 +789,7 @@ class PhotoChronos:
         with self.ui.create_progress() as progress:
             task = progress.add_task("Processing files...", total=len(operations))
 
-            def progress_update(message):
+            def progress_update(_message):
                 progress.update(task, advance=1)
 
             self.file_operations.progress_callback = progress_update

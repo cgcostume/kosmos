@@ -22,14 +22,18 @@ Workflow:
 """
 
 import argparse
+import fnmatch
 import gc
 import json
 import os
 import pathlib
+import pickle
 import sqlite3
 import sys
+import threading
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
@@ -93,18 +97,18 @@ class Monosis:
         self.duplicate_detector = DuplicateDetector(hash_algorithm="xxhash64")
         self.file_operations = FileOperations()
 
-        # Cache configuration
-        self.cache_dir = pathlib.Path.home() / ".monosis"
-        self.cache_db = self.cache_dir / "cache.db"
-        self.scan_results_file = self.cache_dir / "scan_results.json"
-        self.index_cache_file = self.cache_dir / "file_index.json"
+        # Initialize configuration manager (now uses .kosmos)
+        self.config_manager = ConfigManager()
+        self.config = self.config_manager.load()
+
+        # Cache configuration - now uses shared .kosmos directory
+        self.cache_dir = self.config_manager.config_dir
+        self.cache_db = self.config_manager.get_cache_db_path()  # Shared hash cache
+        self.scan_results_file = self.cache_dir / "monosis_scan_results.json"
+        self.index_cache_file = self.cache_dir / "monosis_file_index.pkl"
 
         # Ensure cache directory exists
         self.cache_dir.mkdir(exist_ok=True)
-
-        # Initialize configuration manager
-        self.config_manager = ConfigManager(self.cache_dir)
-        self.config = self.config_manager.load()
 
         # Initialize cache database
         self._init_cache_db()
@@ -113,24 +117,9 @@ class Monosis:
         self._load_cache_into_detector()
 
     def _init_cache_db(self):
-        """Initialize SQLite cache database"""
-        with sqlite3.connect(self.cache_db) as conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS file_hashes (
-                    file_path TEXT PRIMARY KEY,
-                    file_size INTEGER,
-                    mtime REAL,
-                    quick_hash TEXT,
-                    full_hash TEXT,
-                    last_scan REAL
-                )
-            """)
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_full_hash ON file_hashes(full_hash)
-            """)
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_size ON file_hashes(file_size)
-            """)
+        """Initialize SQLite cache database - now handled by shared config"""
+        # Database initialization is now done in kosmos_config.init_shared_cache_db
+        # Just verify it exists and set the path for the duplicate detector
 
     def _load_cache_into_detector(self):
         """Load cached hashes into the duplicate detector for faster lookups"""
@@ -234,6 +223,20 @@ class Monosis:
             self.config_manager.save(self.config)
 
         return True
+
+    def _should_ignore_file(self, file_path: pathlib.Path, file_size: int) -> bool:
+        """Check if file should be ignored based on size and patterns"""
+        # Check minimum file size
+        if file_size < self.config.min_file_size:
+            return True
+
+        # Check ignore patterns
+        file_str = str(file_path)
+        for pattern in self.config.ignore_patterns:
+            if fnmatch.fnmatch(file_str, pattern) or fnmatch.fnmatch(file_path.name, pattern):
+                return True
+
+        return False
 
     def _resolve_network_path(self, path: pathlib.Path) -> Optional[pathlib.Path]:
         r"""Resolve network paths and handle Windows UNC paths like \\server\share"""
@@ -401,15 +404,11 @@ class Monosis:
             return False
 
         # Phase 1: Discovery
-        self.ui.print_info("\n\nPhase 1: File Discovery\n")
+        self.ui.print_info("Phase 1: File Discovery\n")
 
         # Check if we should use cached index
-        if (
-            hasattr(self.args, "use_cached_index")
-            and self.args.use_cached_index
-            and not getattr(self.args, "refresh_index", False)
-        ):
-            self.ui.console.print("Loading cached file indices...", style="white dim")
+        if hasattr(self.args, "use_cached_index") and self.args.use_cached_index:
+            self.ui.console.print("Loading cached file index...", style="white dim")
             file_inventory = self._load_cached_index()
             if file_inventory:
                 self.ui.print_success("Using cached file index - skipping discovery phase")
@@ -417,8 +416,7 @@ class Monosis:
                 self.ui.print_info("No valid cached index found, performing fresh discovery")
                 file_inventory = self._discover_files()
         else:
-            if getattr(self.args, "refresh_index", False):
-                self.ui.print_info("Refreshing file index cache")
+            # Default: always refresh (full discovery)
             file_inventory = self._discover_files()
         if not file_inventory:
             return False
@@ -488,6 +486,10 @@ class Monosis:
                                 file_size = stat_result.st_size
                                 file_mtime = stat_result.st_mtime
 
+                                # Apply filtering
+                                if self._should_ignore_file(file_path, file_size):
+                                    continue
+
                                 file_info = {
                                     "path": file_path,
                                     "size": file_size,
@@ -532,6 +534,10 @@ class Monosis:
                                 stat_result = item.stat()
                                 file_size = stat_result.st_size
                                 file_mtime = stat_result.st_mtime
+
+                                # Apply filtering
+                                if self._should_ignore_file(item, file_size):
+                                    continue
 
                                 file_info = {
                                     "path": item,
@@ -664,46 +670,117 @@ class Monosis:
             self.ui.print_success("No potential duplicates found (all files have unique sizes)")
             return {}
 
-        # Hash potential duplicates with progress
-
+        # Hash potential duplicates with progress (parallel)
         self.ui.console.print()  # Empty line before hashing
 
-        with self.ui.create_progress() as progress:
-            hash_task = progress.add_task("Computing hashes...", total=len(potential_duplicates))
-            duplicates = {}
-
-            # Process files in batches and cache results incrementally
-            batch_size = 100
-            cache_hits = 0
-            for i in range(0, len(potential_duplicates), batch_size):
-                batch = potential_duplicates[i : i + batch_size]
-
-                # Count cache hits in this batch (before hashing)
-                batch_cache_hits = sum(1 for f in batch if str(f) in self.duplicate_detector._hash_cache)
-
-                batch_duplicates = self.duplicate_detector.find_duplicates(batch)
-                duplicates.update(batch_duplicates)
-
-                # Cache the hashes for files in this batch
-                self._cache_batch_hashes(batch, batch_duplicates)
-
-                # Count new cache hits after processing
-                new_cache_hits = (
-                    sum(1 for f in batch if str(f) in self.duplicate_detector._hash_cache) - batch_cache_hits
-                )
-                cache_hits += new_cache_hits
-
-                processed = min(i + batch_size, len(potential_duplicates))
-
-                # Update progress with cache hit info
-                if cache_hits > 0:
-                    progress.update(
-                        hash_task, completed=processed, description=f"Computing hashes... ({cache_hits:,} from cache)"
-                    )
-                else:
-                    progress.update(hash_task, completed=processed)
+        duplicates = self._parallel_hash_files(potential_duplicates)
 
         return duplicates
+
+    def _parallel_hash_files(self, potential_duplicates: list[pathlib.Path]) -> dict:
+        """Hash files in parallel using ThreadPoolExecutor"""
+
+        # Thread-safe progress tracking
+        progress_lock = threading.Lock()
+        total_db_cache_hits = 0
+        completed_files = 0
+        file_hashes = {}  # Thread-safe dict for results
+
+        def hash_single_file(file_path: pathlib.Path) -> tuple[pathlib.Path, Optional[str]]:
+            """Hash a single file and return (path, hash)"""
+            try:
+                # Check database cache first
+                cached_hash = None
+                if self.duplicate_detector._cache_db_path and self.duplicate_detector._cache_db_path.exists():
+                    cached_hash = self.duplicate_detector._check_db_cache(file_path)
+
+                if cached_hash:
+                    return (file_path, cached_hash)
+                # Calculate hash
+                file_hash = self.duplicate_detector.calculate_file_hash(file_path)
+                return (file_path, file_hash)
+            except Exception:
+                return (file_path, None)
+
+        # Start parallel hashing
+        with self.ui.create_progress() as progress:
+            hash_task = progress.add_task("Computing hashes...", total=len(potential_duplicates))
+
+            with ThreadPoolExecutor(max_workers=self.config.max_workers) as executor:
+                # Submit all hash jobs
+                future_to_file = {
+                    executor.submit(hash_single_file, file_path): file_path for file_path in potential_duplicates
+                }
+
+                # Process completed hashes as they finish
+                for future in as_completed(future_to_file):
+                    file_path, file_hash = future.result()
+
+                    with progress_lock:
+                        completed_files += 1
+
+                        if file_hash:
+                            # Check if this was a cache hit
+                            if (
+                                self.duplicate_detector._cache_db_path
+                                and self.duplicate_detector._cache_db_path.exists()
+                                and (
+                                    str(file_path) in self.duplicate_detector._hash_cache
+                                    or self.duplicate_detector._check_db_cache(file_path)
+                                )
+                            ):
+                                total_db_cache_hits += 1
+
+                            # Store hash
+                            if file_hash not in file_hashes:
+                                file_hashes[file_hash] = []
+                            file_hashes[file_hash].append(file_path)
+
+                        # Update progress
+                        if total_db_cache_hits > 0:
+                            progress.update(
+                                hash_task,
+                                completed=completed_files,
+                                description=f"Computing hashes... ({total_db_cache_hits:,} from cache)",
+                            )
+                        else:
+                            progress.update(hash_task, completed=completed_files)
+
+        # Cache all the computed hashes
+        self._cache_all_hashes(file_hashes)
+
+        # Return only groups with duplicates (2+ files with same hash)
+        return {hash_val: paths for hash_val, paths in file_hashes.items() if len(paths) > 1}
+
+    def _cache_all_hashes(self, file_hashes: dict):
+        """Cache all computed hashes to database"""
+        cache_entries = []
+        current_time = time.time()
+
+        for hash_val, file_paths in file_hashes.items():
+            for file_path in file_paths:
+                try:
+                    stat = file_path.stat()
+                    cache_entries.append((str(file_path), stat.st_size, stat.st_mtime, None, hash_val, current_time))
+                except OSError:
+                    continue  # Skip files we can't stat
+
+        # Batch insert into cache database
+        if cache_entries:
+            with sqlite3.connect(self.cache_db) as conn:
+                # Add hash_algorithm and tool_name to each entry
+                cache_entries_with_tool = [
+                    (e[0], e[1], e[2], e[3], e[4], "xxhash64", "monosis", e[5]) for e in cache_entries
+                ]
+                conn.executemany(
+                    """
+                    INSERT OR REPLACE INTO file_hashes 
+                    (file_path, file_size, mtime, quick_hash, full_hash, hash_algorithm, tool_name, last_scan)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                    cache_entries_with_tool,
+                )
+                conn.commit()
 
     def _save_scan_results_v2(self, duplicates: dict, file_inventory: dict):
         """Save enhanced scan results with location categorization"""
@@ -724,9 +801,26 @@ class Monosis:
             if not paths:
                 continue
 
-            file_size = paths[0].stat().st_size
-            total_size += file_size * len(paths)
-            wasted_space += file_size * (len(paths) - 1)
+            try:
+                file_size = paths[0].stat().st_size
+                total_size += file_size * len(paths)
+                wasted_space += file_size * (len(paths) - 1)
+            except OSError:
+                # File was deleted between hashing and results processing
+                # Try other files in the group, or skip this group if all are gone
+                file_size = None
+                for path in paths:
+                    try:
+                        file_size = path.stat().st_size
+                        total_size += file_size * len(paths)
+                        wasted_space += file_size * (len(paths) - 1)
+                        break
+                    except OSError:
+                        continue
+
+                # If all files in this duplicate group are gone, skip it
+                if file_size is None:
+                    continue
 
             # Categorize by location types
             source_files = []
@@ -817,7 +911,19 @@ class Monosis:
             if not paths:
                 continue
 
-            file_size = paths[0].stat().st_size
+            # Get file size safely
+            file_size = None
+            for path in paths:
+                try:
+                    file_size = path.stat().st_size
+                    break
+                except OSError:
+                    continue
+
+            # Skip this group if all files were deleted
+            if file_size is None:
+                continue
+
             source_count = 0
             reference_count = 0
 
@@ -858,6 +964,61 @@ class Monosis:
         self.ui.print_info("\nRun 'monosis analyze' for detailed breakdown")
 
         self.ui.console.print()  # Empty line at end
+
+    def cmd_check(self):
+        """Check specific path for duplicates in other locations"""
+        # Verify database exists
+        if not self.cache_db.exists():
+            self.ui.print_error("No hash database found. Run 'monosis scan' first to build the database.")
+            return False
+
+        # Get the path to check
+        check_path = self.args.path.resolve()
+
+        # Validate path
+        if not check_path.exists():
+            self.ui.print_error(f"Path does not exist: {check_path}")
+            return False
+
+        # Check if it's a file or directory
+        if check_path.is_file():
+            files_to_check = [check_path]
+            self.ui.print_info(f"Checking file: {check_path}")
+        else:
+            # Get all files in directory (recursive by default for check)
+            self.ui.print_info(f"Checking directory: {check_path}")
+            files_to_check = []
+
+            for root, _dirs, files in os.walk(check_path):
+                for filename in files:
+                    file_path = pathlib.Path(root) / filename
+                    files_to_check.append(file_path)
+
+        if not files_to_check:
+            self.ui.print_warning("No files found to check")
+            return True
+
+        # Filter by size if needed
+        min_size = (
+            self.args.min_size if hasattr(self.args, "min_size") and self.args.min_size else self.config.min_file_size
+        )
+        filtered_files = []
+        for f in files_to_check:
+            try:
+                if f.stat().st_size >= min_size:
+                    filtered_files.append(f)
+            except OSError:
+                continue
+
+        self.ui.print_info(f"Files to check: {len(filtered_files):,}")
+
+        # Find duplicates for these files
+        duplicates_found = self._find_duplicates_for_files(filtered_files, check_path)
+
+        # Display results with categorization
+        self._display_check_results(duplicates_found, check_path)
+
+        return True
 
     def cmd_analyze(self):
         """Analyze scan results and show detailed duplicate information"""
@@ -987,8 +1148,8 @@ class Monosis:
         # Check file index cache
         if self.index_cache_file.exists():
             try:
-                with self.index_cache_file.open() as f:
-                    index_data = json.load(f)
+                with self.index_cache_file.open("rb") as f:
+                    index_data = pickle.load(f)
                     total_cached_files = sum(
                         len(loc.get("files", [])) for loc in index_data.get("locations", {}).values()
                     )
@@ -1001,12 +1162,12 @@ class Monosis:
                         except (ValueError, AttributeError):
                             pass
                     self.ui.console.print(
-                        f"  Number of indices: {total_cached_files:,} files (from {cache_timestamp})", style="white dim"
+                        f"  Indexed files: {total_cached_files:,} (from {cache_timestamp})", style="white dim"
                     )
-            except (json.JSONDecodeError, KeyError):
-                self.ui.console.print("  File indices corrupted", style="white dim")
+            except (pickle.UnpicklingError, KeyError, EOFError):
+                self.ui.console.print("  File index corrupted", style="white dim")
         else:
-            self.ui.console.print("  Number of indices: 0", style="white dim")
+            self.ui.console.print("  Indexed files: 0", style="white dim")
 
         # Check scan results
         if self.scan_results_file.exists():
@@ -1020,20 +1181,6 @@ class Monosis:
                 except (ValueError, AttributeError):
                     pass
                 self.ui.console.print(f"  Last scan: {timestamp}", style="white dim")
-                self.ui.console.print(f"  Duplicate groups: {data['summary']['duplicate_groups']:,}", style="white dim")
-                self.ui.console.print(f"  Total duplicates: {data['summary']['total_duplicates']:,}", style="white dim")
-                # Handle both old 'wasted_space_gb' and new 'wasted_space_gib' keys
-                wasted_space_key = "wasted_space_gib" if "wasted_space_gib" in data["summary"] else "wasted_space_gb"
-                wasted_gib = data["summary"][wasted_space_key]
-                if wasted_gib >= 1:
-                    wasted_str = f"{wasted_gib:.2f} GiB"
-                elif wasted_gib * (1024**3) >= 1024**2:
-                    wasted_str = f"{wasted_gib * (1024**3) / (1024**2):.1f} MiB"
-                elif wasted_gib * (1024**3) >= 1024:
-                    wasted_str = f"{wasted_gib * (1024**3) / 1024:.1f} KiB"
-                else:
-                    wasted_str = f"{int(wasted_gib * (1024**3))} B"
-                self.ui.console.print(f"  Wasted space: {wasted_str}", style="white dim")
         else:
             self.ui.console.print("  No scan results found", style="white dim")
 
@@ -1048,8 +1195,8 @@ class Monosis:
         # Check for specific clean options
         if hasattr(self.args, "hashes_only") and self.args.hashes_only:
             return self._clean_hashes_only()
-        if hasattr(self.args, "indices_only") and self.args.indices_only:
-            return self._clean_indices_only()
+        if hasattr(self.args, "index_only") and self.args.index_only:
+            return self._clean_index_only()
         if hasattr(self.args, "cache_only") and self.args.cache_only:
             return self._clean_cache_only()
 
@@ -1124,12 +1271,12 @@ class Monosis:
 
         return True
 
-    def _clean_indices_only(self):
+    def _clean_index_only(self):
         """Clean only the file index cache"""
         if self.index_cache_file.exists():
             try:
-                with self.index_cache_file.open() as f:
-                    index_data = json.load(f)
+                with self.index_cache_file.open("rb") as f:
+                    index_data = pickle.load(f)
                     total_cached_files = sum(
                         len(loc.get("files", [])) for loc in index_data.get("locations", {}).values()
                     )
@@ -1140,7 +1287,7 @@ class Monosis:
                         self.ui.print_success("File index cache deleted")
                     else:
                         self.ui.print_info("Index cache clean cancelled")
-            except (json.JSONDecodeError, KeyError):
+            except (pickle.UnpicklingError, KeyError, EOFError):
                 if self.ui.confirm("\nThis will delete the corrupted file index cache. Continue?"):
                     self.index_cache_file.unlink()
                     self.ui.print_success("Corrupted file index cache deleted")
@@ -1352,6 +1499,182 @@ class Monosis:
 
         return stats
 
+    def _find_duplicates_for_files(self, files_to_check: list[pathlib.Path], check_path: pathlib.Path) -> dict:
+        """Find duplicates for specified files by querying hash database"""
+        duplicates = {}
+
+        with self.ui.create_progress() as progress:
+            task = progress.add_task("Checking for duplicates...", total=len(files_to_check))
+
+            for file_path in files_to_check:
+                progress.update(task, advance=1)
+
+                try:
+                    # Get file hash (calculate if not cached)
+                    file_hash = None
+
+                    # First check if we have it in cache
+                    if self.duplicate_detector._cache_db_path and self.duplicate_detector._cache_db_path.exists():
+                        file_hash = self.duplicate_detector._check_db_cache(file_path)
+
+                    # Calculate if not cached
+                    if not file_hash:
+                        file_hash = self.duplicate_detector.calculate_file_hash(file_path)
+                        # Cache it for future use
+                        if file_hash:
+                            self._cache_single_file_hash(file_path, file_hash)
+
+                    if not file_hash:
+                        continue
+
+                    # Query database for other files with same hash
+                    other_files = self._query_hash_in_database(file_hash, exclude_path=str(file_path))
+
+                    # Apply external-only filter if requested
+                    if other_files and hasattr(self.args, "external_only") and self.args.external_only:
+                        # Filter out files that are within check_path
+                        check_path_str = str(check_path)
+                        other_files = [f for f in other_files if not f.startswith(check_path_str)]
+
+                    if other_files:
+                        duplicates[str(file_path)] = {
+                            "hash": file_hash,
+                            "size": file_path.stat().st_size,
+                            "duplicates": other_files,
+                        }
+
+                except OSError:
+                    continue  # Skip files we can't access
+
+        return duplicates
+
+    def _query_hash_in_database(self, file_hash: str, exclude_path: Optional[str] = None) -> list[str]:
+        """Query database for all files with given hash"""
+        results = []
+
+        with sqlite3.connect(self.cache_db) as conn:
+            if exclude_path:
+                cursor = conn.execute(
+                    "SELECT file_path FROM file_hashes WHERE full_hash = ? AND file_path != ?",
+                    (file_hash, exclude_path),
+                )
+            else:
+                cursor = conn.execute("SELECT file_path FROM file_hashes WHERE full_hash = ?", (file_hash,))
+
+            results = [row[0] for row in cursor.fetchall()]
+
+        return results
+
+    def _cache_single_file_hash(self, file_path: pathlib.Path, file_hash: str):
+        """Cache a single file's hash to database"""
+        try:
+            stat = file_path.stat()
+            with sqlite3.connect(self.cache_db) as conn:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO file_hashes 
+                    (file_path, file_size, mtime, quick_hash, full_hash, hash_algorithm, tool_name, last_scan)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (str(file_path), stat.st_size, stat.st_mtime, None, file_hash, "xxhash64", "monosis", time.time()),
+                )
+                conn.commit()
+        except OSError:
+            pass
+
+    def _display_check_results(self, duplicates_found: dict, check_path: pathlib.Path):
+        """Display check results with categorization"""
+        if not duplicates_found:
+            self.ui.print_success("\n✅ No duplicates found!")
+            return
+
+        # Categorize results
+        safe_to_delete = []
+        review_needed = []
+        keep_files = []
+
+        for file_path, info in duplicates_found.items():
+            file_p = pathlib.Path(file_path)
+            duplicate_locations = info["duplicates"]
+
+            # Determine category based on where duplicates are
+            has_reference = False
+            has_source = False
+            has_target = False
+
+            for dup_path in duplicate_locations:
+                if self.config.reference_location and dup_path.startswith(self.config.reference_location):
+                    has_reference = True
+                elif self.config.target_location and dup_path.startswith(self.config.target_location):
+                    has_target = True
+                else:
+                    # Check if it's in a source location
+                    for source_loc in self.config.source_locations:
+                        if dup_path.startswith(source_loc):
+                            has_source = True
+                            break
+
+            # Categorize
+            if has_reference:
+                safe_to_delete.append((file_p, info, "Backed up in reference location"))
+            elif has_source and not has_target:
+                review_needed.append((file_p, info, "Duplicate in another source location"))
+            elif has_target and not has_source:
+                keep_files.append((file_p, info, "Only in temporary target location"))
+            else:
+                review_needed.append((file_p, info, "Review duplicate locations"))
+
+        # Display results
+        self.ui.print_info(f"\n=== Found {len(duplicates_found)} files with duplicates ===\n")
+
+        # Show safe to delete files
+        if safe_to_delete:
+            self.ui.print_success(f"✅ SAFE TO DELETE ({len(safe_to_delete)} files)")
+            for file_p, info, reason in safe_to_delete[:10]:  # Show first 10
+                rel_path = file_p.relative_to(check_path) if check_path in file_p.parents else file_p.name
+                size_mb = info["size"] / (1024**2)
+                self.ui.console.print(f"  {rel_path} ({size_mb:.1f} MB)")
+                for dup in info["duplicates"][:3]:  # Show first 3 duplicates
+                    self.ui.console.print(f"    → {dup}", style="green dim")
+                self.ui.console.print(f"    [{reason}]", style="green dim")
+            if len(safe_to_delete) > 10:
+                self.ui.console.print(f"  ... and {len(safe_to_delete) - 10} more", style="dim")
+
+        # Show files needing review
+        if review_needed:
+            self.ui.print_warning(f"\n⚠️  REVIEW NEEDED ({len(review_needed)} files)")
+            for file_p, info, reason in review_needed[:10]:
+                rel_path = file_p.relative_to(check_path) if check_path in file_p.parents else file_p.name
+                size_mb = info["size"] / (1024**2)
+                self.ui.console.print(f"  {rel_path} ({size_mb:.1f} MB)")
+                for dup in info["duplicates"][:3]:
+                    self.ui.console.print(f"    → {dup}", style="yellow dim")
+                self.ui.console.print(f"    [{reason}]", style="yellow dim")
+            if len(review_needed) > 10:
+                self.ui.console.print(f"  ... and {len(review_needed) - 10} more", style="dim")
+
+        # Show files to keep
+        if keep_files:
+            self.ui.print_error(f"\n❌ KEEP THESE ({len(keep_files)} files)")
+            for file_p, info, reason in keep_files[:5]:
+                rel_path = file_p.relative_to(check_path) if check_path in file_p.parents else file_p.name
+                size_mb = info["size"] / (1024**2)
+                self.ui.console.print(f"  {rel_path} ({size_mb:.1f} MB)")
+                for dup in info["duplicates"][:2]:
+                    self.ui.console.print(f"    → {dup}", style="red dim")
+                self.ui.console.print(f"    [{reason}]", style="red dim")
+            if len(keep_files) > 5:
+                self.ui.console.print(f"  ... and {len(keep_files) - 5} more", style="dim")
+
+        # Summary
+        total_size = sum(info["size"] for info in duplicates_found.values())
+        safe_size = sum(info["size"] for _, info, _ in safe_to_delete)
+
+        self.ui.print_info("\n=== Summary ===")
+        self.ui.console.print(f"Total duplicate size: {total_size / (1024**3):.2f} GB")
+        if safe_to_delete:
+            self.ui.console.print(f"Safe to reclaim: {safe_size / (1024**3):.2f} GB", style="green")
+
     def _save_file_index_cache(self, file_inventory: dict):
         """Save file index to cache for future scans"""
         cache_data = {"timestamp": datetime.now(timezone.utc).isoformat(), "locations": {}}
@@ -1382,8 +1705,8 @@ class Monosis:
 
         # Save cache to file
         try:
-            with self.index_cache_file.open("w") as f:
-                json.dump(cache_data, f, indent=2)
+            with self.index_cache_file.open("wb") as f:
+                pickle.dump(cache_data, f, protocol=pickle.HIGHEST_PROTOCOL)
         except OSError:
             # Cache save failed, but don't crash the scan
             pass
@@ -1394,9 +1717,9 @@ class Monosis:
             return {}
 
         try:
-            with self.index_cache_file.open() as f:
-                cache_data = json.load(f)
-        except (json.JSONDecodeError, OSError):
+            with self.index_cache_file.open("rb") as f:
+                cache_data = pickle.load(f)
+        except (pickle.UnpicklingError, OSError, EOFError):
             return {}
 
         # Check if current locations match cached locations
@@ -1493,13 +1816,17 @@ class Monosis:
         # Batch insert into cache database
         if cache_entries:
             with sqlite3.connect(self.cache_db) as conn:
+                # Add hash_algorithm and tool_name to each entry
+                cache_entries_with_tool = [
+                    (e[0], e[1], e[2], e[3], e[4], "xxhash64", "monosis", e[5]) for e in cache_entries
+                ]
                 conn.executemany(
                     """
                     INSERT OR REPLACE INTO file_hashes 
-                    (file_path, file_size, mtime, quick_hash, full_hash, last_scan)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    (file_path, file_size, mtime, quick_hash, full_hash, hash_algorithm, tool_name, last_scan)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                    cache_entries,
+                    cache_entries_with_tool,
                 )
                 conn.commit()
 
@@ -1563,11 +1890,16 @@ Examples:
     scan_parser.add_argument("-r", "--recursive", action="store_true", help="Scan subdirectories recursively")
     scan_parser.add_argument("--no-cache", action="store_true", help="Don't use cached hashes")
     scan_parser.add_argument(
-        "--use-cached-index", action="store_true", help="Skip file discovery, use cached file index from previous scan"
+        "--use-cached-index",
+        action="store_true",
+        help="Skip file discovery, use cached file index from previous scan",
     )
-    scan_parser.add_argument(
-        "--refresh-index", action="store_true", help="Force refresh of file index cache (ignores cached index)"
-    )
+
+    # Check command
+    check_parser = subparsers.add_parser("check", help="Check specific path for duplicates")
+    check_parser.add_argument("path", type=pathlib.Path, help="Path to check (file or directory)")
+    check_parser.add_argument("--external-only", action="store_true", help="Only show duplicates outside checked path")
+    check_parser.add_argument("--min-size", type=int, help="Minimum file size in bytes to check")
 
     # Analyze command
     subparsers.add_parser("analyze", help="Analyze scan results with location details")
@@ -1597,7 +1929,7 @@ Examples:
     clean_parser = subparsers.add_parser("clean", help="Clean cache and results")
     clean_group = clean_parser.add_mutually_exclusive_group()
     clean_group.add_argument("--hashes-only", action="store_true", help="Only clear hash cache")
-    clean_group.add_argument("--indices-only", action="store_true", help="Only clear file index cache")
+    clean_group.add_argument("--index-only", action="store_true", help="Only clear file index cache")
     clean_group.add_argument(
         "--cache-only", action="store_true", help="Clear both hash and index cache, preserve scan results"
     )
@@ -1617,6 +1949,9 @@ Examples:
         # Show configuration first for scan
         app.show_configuration()
         success = app.cmd_scan()
+    elif args.command == "check":
+        # Check doesn't need configuration display
+        success = app.cmd_check()
     elif args.command == "analyze":
         # Show configuration first for analyze
         app.show_configuration()

@@ -15,6 +15,8 @@ Features:
 
 import hashlib
 import pathlib
+import sqlite3
+import time
 from typing import Optional
 
 try:
@@ -28,15 +30,17 @@ except ImportError:
 class DuplicateDetector:
     """High-performance duplicate file detection with in-memory caching"""
 
-    def __init__(self, hash_algorithm: str = "md5", chunk_size: int = 65536):
+    def __init__(self, hash_algorithm: str = "md5", chunk_size: int = 65536, tool_name: str = "duplicate_detector"):
         """Initialize duplicate detector
 
         Args:
             hash_algorithm: Hash algorithm to use ('md5', 'sha256', or 'xxhash64')
             chunk_size: Chunk size for streaming hash calculation
+            tool_name: Name of the tool using this detector for database tracking
         """
         self.hash_algorithm = hash_algorithm.lower()
         self.chunk_size = chunk_size
+        self.tool_name = tool_name
 
         if self.hash_algorithm == "xxhash64" and not XXHASH_AVAILABLE:
             raise ValueError("xxhash package required for xxhash64 algorithm. Install with: pip install xxhash")
@@ -98,6 +102,11 @@ class DuplicateDetector:
 
             # Store in memory cache
             self._hash_cache[file_key] = file_hash
+
+            # Store in database cache if available
+            if self._cache_db_path and self._cache_db_path.exists():
+                self._save_to_db_cache(file_path, file_hash)
+
             return file_hash
 
         except OSError as e:
@@ -105,8 +114,6 @@ class DuplicateDetector:
 
     def _check_db_cache(self, file_path: pathlib.Path) -> Optional[str]:
         """Check if file hash exists in database cache"""
-        import sqlite3
-
         try:
             stat = file_path.stat()
             with sqlite3.connect(self._cache_db_path) as conn:
@@ -118,6 +125,33 @@ class DuplicateDetector:
                 return result[0] if result else None
         except (OSError, sqlite3.Error):
             return None
+
+    def _save_to_db_cache(self, file_path: pathlib.Path, file_hash: str):
+        """Save file hash to database cache with tool name"""
+        try:
+            stat = file_path.stat()
+            with sqlite3.connect(self._cache_db_path) as conn:
+                # Replace existing entry for this file path
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO file_hashes 
+                    (file_path, file_size, mtime, full_hash, hash_algorithm, tool_name, last_scan)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(file_path),
+                        stat.st_size,
+                        stat.st_mtime,
+                        file_hash,
+                        self.hash_algorithm,
+                        self.tool_name,
+                        time.time(),
+                    ),
+                )
+                conn.commit()
+        except (OSError, sqlite3.Error):
+            # Silently ignore database errors - don't break hash calculation
+            pass
 
     def files_are_identical(self, file1: pathlib.Path, file2: pathlib.Path) -> bool:
         """Check if two files are identical
