@@ -28,6 +28,7 @@ import json
 import os
 import pathlib
 import pickle
+import signal
 import sqlite3
 import sys
 import threading
@@ -40,6 +41,7 @@ from typing import Optional
 from rich.table import Table
 
 # Local imports
+from auxiliary import format_bytes, format_path_for_display
 from console_ui import ConsoleUI
 from duplicate_detector import DuplicateDetector
 from file_indexer import FileIndexer
@@ -61,6 +63,7 @@ class Monosis:
         self.ui = ConsoleUI()
         self.duplicate_detector = DuplicateDetector(hash_algorithm="xxhash64")
         self.file_operations = FileOperations()
+        self._shutdown_requested = False
 
         # Initialize configuration manager (now uses .kosmos)
         self.config_manager = ConfigManager()
@@ -75,9 +78,18 @@ class Monosis:
         # Initialize file indexer
         self.file_indexer = FileIndexer(
             cache_file=self.index_cache_file,
-            min_file_size=self.config.min_file_size,
             ignore_patterns=self.config.ignore_patterns,
         )
+
+        # Set up signal handlers for graceful shutdown
+        signal.signal(signal.SIGINT, self._signal_handler)
+        if hasattr(signal, "SIGTERM"):
+            signal.signal(signal.SIGTERM, self._signal_handler)
+
+    def _signal_handler(self, signum, frame):
+        """Handle shutdown signals gracefully"""
+        self._shutdown_requested = True
+        self.ui.print_warning("\nShutdown requested... saving current progress and exiting.")
 
         # Ensure cache directory exists
         self.cache_dir.mkdir(exist_ok=True)
@@ -386,17 +398,19 @@ class Monosis:
         if not file_inventory:
             return False
 
-        # Phase 2: Duplicate Detection
-        self.ui.print_info("\nPhase 2: Duplicate Detection\n")
-        duplicates = self._detect_duplicates(file_inventory)
+        # Phase 2: Hash Computation and Database Creation
+        self.ui.print_info("\nPhase 2: Hash Computation\n")
+        self._compute_all_hashes(file_inventory)
 
-        # Update scan time and save results
+        # Update scan time and save index
         self.config.update_scan_time()
         self.config_manager.save(self.config)
 
-        # Save and show results
-        self._save_scan_results_v2(duplicates, file_inventory)
-        self._show_scan_summary_v2(duplicates, file_inventory)
+        # Save file index for future use
+        self.file_indexer.save_cache(file_inventory)
+
+        # Show scan summary
+        self._show_scan_summary_with_hashes(file_inventory)
 
         return True
 
@@ -431,37 +445,30 @@ class Monosis:
 
             # Define progress callback for file discovery
             def progress_callback(location_str, _location_files, total_files, final=False):
-                location_display = location_str.replace(str(pathlib.Path.home()), "~")
-
-                # Calculate total size from file_inventory if available
-                total_size = sum(loc.get("size", 0) for loc in getattr(file_inventory, "locations", {}).values())
-
-                # Format size for display
-                if total_size >= 1024**3:
-                    size_str = f"{total_size / (1024**3):.1f} GiB"
-                elif total_size >= 1024**2:
-                    size_str = f"{total_size / (1024**2):.1f} MiB"
-                elif total_size >= 1024:
-                    size_str = f"{total_size / 1024:.1f} KiB"
-                else:
-                    size_str = f"{total_size} B"
+                location_display = format_path_for_display(location_str)
 
                 if final:
                     progress.update(
                         discovery_task,
-                        description=f"Completed {location_display} → Total: {total_files:,} files, {size_str}",
+                        description=f"Completed {location_display} → {total_files:,} files",
                     )
                 else:
                     progress.update(
                         discovery_task,
-                        description=f"Scanning {location_display} → {total_files:,} files, {size_str}",
+                        description=f"Scanning {location_display} → {total_files:,} files",
                     )
 
-            # Set progress callback
+            # Set progress callback and shutdown flag
             self.file_indexer.progress_callback = progress_callback
+            self.file_indexer.shutdown_requested = lambda: self._shutdown_requested
 
             # Discover files
             file_inventory = self.file_indexer.discover_files(locations_to_scan, recursive=self.args.recursive)
+
+            # Check if shutdown was requested during discovery
+            if self._shutdown_requested:
+                self.ui.print_info("File discovery interrupted. Partial results saved.")
+                return {}
 
         # Show discovery summary in table format
 
@@ -538,13 +545,14 @@ class Monosis:
         return duplicates
 
     def _parallel_hash_files(self, potential_duplicates: list[pathlib.Path]) -> dict:
-        """Hash files in parallel using ThreadPoolExecutor"""
+        """Hash files in parallel using ThreadPoolExecutor with incremental cache saves"""
 
         # Thread-safe progress tracking
         progress_lock = threading.Lock()
         total_db_cache_hits = 0
         completed_files = 0
         file_hashes = {}  # Thread-safe dict for results
+        pending_cache_entries = []  # Batch cache entries before saving
 
         def hash_single_file(file_path: pathlib.Path) -> tuple[pathlib.Path, Optional[str], bool]:
             """Hash a single file and return (path, hash, was_cached)"""
@@ -575,6 +583,17 @@ class Monosis:
 
                 # Process completed hashes as they finish
                 for future in as_completed(future_to_file):
+                    # Check for shutdown signal
+                    if self._shutdown_requested:
+                        # Save any pending cache entries before shutdown
+                        if pending_cache_entries:
+                            self._save_cache_batch(pending_cache_entries)
+                            pending_cache_entries.clear()
+                        # Cancel remaining futures and break
+                        for remaining_future in future_to_file:
+                            remaining_future.cancel()
+                        break
+
                     file_path, file_hash, was_cached = future.result()
 
                     with progress_lock:
@@ -584,57 +603,80 @@ class Monosis:
                             # Track cache hits
                             if was_cached:
                                 total_db_cache_hits += 1
+                            else:
+                                # Add to pending cache entries for batch save
+                                try:
+                                    stat = file_path.stat()
+                                    pending_cache_entries.append((file_path, stat, file_hash))
+                                except OSError:
+                                    pass  # Skip files we can't stat
 
                             # Store hash
                             if file_hash not in file_hashes:
                                 file_hashes[file_hash] = []
                             file_hashes[file_hash].append(file_path)
 
-                        # Update progress
-                        if total_db_cache_hits > 0:
-                            progress.update(
-                                hash_task,
-                                completed=completed_files,
-                                description=f"Computing hashes... ({total_db_cache_hits:,} from cache)",
-                            )
-                        else:
-                            progress.update(hash_task, completed=completed_files)
+                            # Check if we should save cache batch
+                            computed_hashes = len(pending_cache_entries)
+                            if computed_hashes >= self.config.cache_batch_size:
+                                self._save_cache_batch(pending_cache_entries)
+                                pending_cache_entries.clear()
 
-        # Cache all the computed hashes
-        self._cache_all_hashes(file_hashes)
+                        # Update progress
+                        progress.update(
+                            hash_task,
+                            completed=completed_files,
+                            description=f"Computing hashes... ({total_db_cache_hits:,} from cache)",
+                        )
+
+        # Save any remaining cache entries
+        if pending_cache_entries:
+            self._save_cache_batch(pending_cache_entries)
+
+        # Check if shutdown was requested
+        if self._shutdown_requested:
+            self.ui.print_info("Saved progress before shutdown.")
+            sys.exit(0)
 
         # Return only groups with duplicates (2+ files with same hash)
         return {hash_val: paths for hash_val, paths in file_hashes.items() if len(paths) > 1}
 
-    def _cache_all_hashes(self, file_hashes: dict):
-        """Cache all computed hashes to database"""
-        cache_entries = []
+    def _save_cache_batch(self, cache_entries: list[tuple]):
+        """Save a batch of cache entries to database"""
+        if not cache_entries:
+            return
+
         current_time = time.time()
+        db_entries = []
 
-        for hash_val, file_paths in file_hashes.items():
-            for file_path in file_paths:
-                try:
-                    stat = file_path.stat()
-                    cache_entries.append((str(file_path), stat.st_size, stat.st_mtime, None, hash_val, current_time))
-                except OSError:
-                    continue  # Skip files we can't stat
+        for file_path, stat_info, file_hash in cache_entries:
+            db_entries.append(
+                (
+                    str(file_path),
+                    stat_info.st_size,
+                    stat_info.st_mtime,
+                    None,  # quick_hash
+                    file_hash,
+                    "xxhash64",
+                    "monosis",
+                    current_time,
+                )
+            )
 
-        # Batch insert into cache database
-        if cache_entries:
+        try:
             with sqlite3.connect(self.cache_db) as conn:
-                # Add hash_algorithm and tool_name to each entry
-                cache_entries_with_tool = [
-                    (e[0], e[1], e[2], e[3], e[4], "xxhash64", "monosis", e[5]) for e in cache_entries
-                ]
                 conn.executemany(
                     """
                     INSERT OR REPLACE INTO file_hashes 
                     (file_path, file_size, mtime, quick_hash, full_hash, hash_algorithm, tool_name, last_scan)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                    cache_entries_with_tool,
+                    """,
+                    db_entries,
                 )
                 conn.commit()
+        except sqlite3.Error:
+            # Ignore database errors - don't break the hashing process
+            pass
 
     def _save_scan_results_v2(self, duplicates: dict, file_inventory: dict):
         """Save enhanced scan results with location categorization"""
@@ -749,78 +791,98 @@ class Monosis:
             json.dump(data, f, indent=2)
 
     def _show_scan_summary_v2(self, duplicates: dict, file_inventory: dict):
-        """Show enhanced scan summary with location-based categorization"""
-        if not duplicates:
-            self.ui.print_success("\nNo duplicates found!")
-            self.ui.console.print()  # Empty line at end
+        """Show scan summary focused on file discovery results"""
+        # Calculate total duplicate groups and files
+        duplicate_groups = len(duplicates)
+        duplicate_files = sum(len(paths) for paths in duplicates.values())
+
+        # Show scan completion
+        self.ui.print_success("\nScan complete!")
+
+        # Show file discovery summary
+        self.ui.print_info(f"Total files indexed: {file_inventory['total_files']:,}")
+        if duplicate_groups > 0:
+            self.ui.print_info(f"Files with matching hashes: {duplicate_files:,} in {duplicate_groups:,} groups")
+
+        # Show location breakdown
+        for location_str, location_info in file_inventory["locations"].items():
+            location_display = format_path_for_display(location_str)
+            file_count = location_info["count"]
+            size = location_info["size"]
+            size_str = format_bytes(size)
+
+            location_type = location_info["type"].capitalize()
+            self.ui.print_info(f"  {location_type}: {file_count:,} files, {size_str} in {location_display}")
+
+        self.ui.print_info("\nUse 'monosis check <path>' to analyze specific files for duplicates")
+
+    def _show_scan_summary_index_only(self, file_inventory: dict):
+        """Show scan summary for index-only results (no duplicate analysis)"""
+        # Show scan completion
+        self.ui.print_success("\nScan complete!")
+
+        # Show file discovery summary
+        self.ui.print_info(f"Total files indexed: {file_inventory['total_files']:,}")
+
+        # Show location breakdown
+        for location_str, location_info in file_inventory["locations"].items():
+            location_display = format_path_for_display(location_str)
+            file_count = location_info["count"]
+            size = location_info["size"]
+            size_str = format_bytes(size)
+
+            location_type = location_info["type"].capitalize()
+            self.ui.print_info(f"  {location_type}: {file_count:,} files, {size_str} in {location_display}")
+
+        self.ui.print_info("\nIndex saved. Use 'monosis check <path>' to find duplicates.")
+
+    def _compute_all_hashes(self, file_inventory: dict):
+        """Phase 2: Compute hashes for all discovered files"""
+        # Collect all file paths from inventory
+        all_files = []
+        for location_info in file_inventory["locations"].values():
+            for file_info in location_info["files"]:
+                all_files.append(file_info["path"])
+
+        if not all_files:
+            self.ui.print_info("No files to hash")
             return
 
-        # Calculate categorized statistics
-        new_files = 0
-        backed_up_files = 0
-        source_duplicates = 0
-        total_wasted_space = 0
+        # Use existing parallel hashing with incremental cache saves
+        self._parallel_hash_files(all_files)
 
-        for paths in duplicates.values():
-            if not paths:
-                continue
+    def _show_scan_summary_with_hashes(self, file_inventory: dict):
+        """Show scan summary including hash database status"""
+        # Show scan completion
+        self.ui.print_success("\nScan complete!")
 
-            # Get file size safely
-            file_size = None
-            for path in paths:
-                try:
-                    file_size = path.stat().st_size
-                    break
-                except OSError:
-                    continue
+        # Show file discovery summary
+        self.ui.print_info(f"Total files indexed: {file_inventory['total_files']:,}")
 
-            # Skip this group if all files were deleted
-            if file_size is None:
-                continue
+        # Show hash database status
+        if self.cache_db.exists():
+            try:
+                with sqlite3.connect(self.cache_db) as conn:
+                    cursor = conn.execute("SELECT COUNT(*) FROM file_hashes")
+                    hash_count = cursor.fetchone()[0]
+                    self.ui.print_info(f"Hashes computed: {hash_count:,}")
+            except Exception:
+                pass
 
-            source_count = 0
-            reference_count = 0
+        # Show location breakdown
+        for location_str, location_info in file_inventory["locations"].items():
+            location_display = format_path_for_display(location_str)
+            file_count = location_info["count"]
+            size = location_info["size"]
+            size_str = format_bytes(size)
 
-            for file_path in paths:
-                for location_str, location_info in file_inventory["locations"].items():
-                    if str(file_path).startswith(location_str):
-                        if location_info["type"] == "source":
-                            source_count += 1
-                        elif location_info["type"] == "reference":
-                            reference_count += 1
-                        break
+            location_type = location_info["type"].capitalize()
+            self.ui.print_info(f"  {location_type}: {file_count:,} files, {size_str} in {location_display}")
 
-            # Categorize this duplicate group
-            if source_count > 0 and reference_count == 0:
-                if source_count > 1:
-                    source_duplicates += source_count
-                    total_wasted_space += file_size * (source_count - 1)
-                else:
-                    new_files += 1
-            elif source_count > 0 and reference_count > 0:
-                backed_up_files += source_count
-                total_wasted_space += file_size * source_count  # All source copies are redundant
-
-        # Show categorized summary
-        self.ui.print_success("\n=== Scan Complete ===")
-        self.ui.print_info(f"Found {len(duplicates):,} groups of duplicates")
-
-        if new_files > 0:
-            self.ui.print_info(f"📝 New files (need backup): {new_files}")
-        if backed_up_files > 0:
-            self.ui.print_success(f"✅ Already backed up: {backed_up_files} (can remove from sources)")
-        if source_duplicates > 0:
-            self.ui.print_warning(f"🔄 Source duplicates: {source_duplicates}")
-
-        if total_wasted_space > 0:
-            self.ui.print_info(f"💾 Recoverable space: {total_wasted_space / (1024**3):.2f} GB")
-
-        self.ui.print_info("\nRun 'monosis analyze' for detailed breakdown")
-
-        self.ui.console.print()  # Empty line at end
+        self.ui.print_info("\nDatabase ready. Use 'monosis check <path>' for fast duplicate lookups.")
 
     def cmd_check(self):
-        """Check specific path for duplicates in other locations"""
+        """Check specific path for duplicates (files) or similar folders (directories)"""
         # Verify database exists
         if not self.cache_db.exists():
             self.ui.print_error("No hash database found. Run 'monosis scan' first to build the database.")
@@ -836,43 +898,271 @@ class Monosis:
 
         # Check if it's a file or directory
         if check_path.is_file():
-            files_to_check = [check_path]
-            self.ui.print_info(f"Checking file: {check_path}")
-        else:
-            # Get all files in directory (recursive by default for check)
-            self.ui.print_info(f"Checking directory: {check_path}")
-            files_to_check = []
+            return self._check_file_duplicates(check_path)
+        return self._check_folder_similarity(check_path)
 
-            for root, _dirs, files in os.walk(check_path):
-                for filename in files:
-                    file_path = pathlib.Path(root) / filename
-                    files_to_check.append(file_path)
-
-        if not files_to_check:
-            self.ui.print_warning("No files found to check")
-            return True
+    def _check_file_duplicates(self, file_path: pathlib.Path):
+        """Check a single file for exact duplicates"""
+        self.ui.print_info(f"Checking file: {file_path}")
 
         # Filter by size if needed
         min_size = (
             self.args.min_size if hasattr(self.args, "min_size") and self.args.min_size else self.config.min_file_size
         )
-        filtered_files = []
-        for f in files_to_check:
-            try:
-                if f.stat().st_size >= min_size:
-                    filtered_files.append(f)
-            except OSError:
-                continue
 
-        self.ui.print_info(f"Files to check: {len(filtered_files):,}")
+        try:
+            if file_path.stat().st_size < min_size:
+                self.ui.print_warning("File too small, skipping")
+                return True
+        except OSError:
+            self.ui.print_error("Cannot access file")
+            return False
 
-        # Find duplicates for these files
-        duplicates_found = self._find_duplicates_for_files(filtered_files, check_path)
+        # Find duplicates for this file
+        duplicates_found = self._find_duplicates_for_files([file_path], file_path.parent)
 
-        # Display results with categorization
-        self._display_check_results(duplicates_found, check_path)
-
+        # Display results
+        self._display_check_results(duplicates_found, file_path.parent)
         return True
+
+    def _check_folder_similarity(self, folder_path: pathlib.Path):
+        """Check a folder for similar folders based on content overlap"""
+        self.ui.print_info(f"Checking folder: {folder_path}")
+
+        # Get folder inventory (all files with their hashes)
+        folder_inventory = self._get_folder_inventory(folder_path)
+
+        if not folder_inventory:
+            self.ui.print_warning("No files found in folder")
+            return True
+
+        self.ui.print_info(f"Files in folder: {len(folder_inventory):,}")
+
+        # Find similar folders
+        similar_folders = self._find_similar_folders(folder_path, folder_inventory)
+
+        # Display results
+        self._display_folder_similarity_results(folder_path, folder_inventory, similar_folders)
+        return True
+
+    def _get_folder_inventory(self, folder_path: pathlib.Path) -> dict[str, dict]:
+        """Get inventory of all files in a folder with their hashes"""
+        inventory = {}
+        min_size = self.config.min_file_size
+
+        with self.ui.create_progress() as progress:
+            task = progress.add_task("Building folder inventory...", total=None)
+            file_count = 0
+
+            for root, _dirs, files in os.walk(folder_path):
+                for filename in files:
+                    file_path = pathlib.Path(root) / filename
+
+                    try:
+                        stat_info = file_path.stat()
+                        if stat_info.st_size < min_size:
+                            continue
+
+                        # Get relative path within the folder for comparison
+                        rel_path = file_path.relative_to(folder_path)
+
+                        # Get or calculate hash
+                        file_hash = None
+                        if self.duplicate_detector._cache_db_path and self.duplicate_detector._cache_db_path.exists():
+                            file_hash = self.duplicate_detector._check_db_cache(file_path)
+
+                        if not file_hash:
+                            file_hash = self.duplicate_detector.calculate_file_hash(file_path)
+                            if file_hash:
+                                self._cache_single_file_hash(file_path, file_hash)
+
+                        if file_hash:
+                            inventory[str(rel_path)] = {
+                                "hash": file_hash,
+                                "size": stat_info.st_size,
+                                "full_path": str(file_path),
+                            }
+
+                        file_count += 1
+                        if file_count % 100 == 0:
+                            progress.update(task, description=f"Building folder inventory... {file_count} files")
+
+                    except OSError:
+                        continue
+
+            progress.update(task, description=f"Completed inventory: {len(inventory)} files")
+
+        return inventory
+
+    def _find_similar_folders(
+        self, check_folder: pathlib.Path, folder_inventory: dict[str, dict]
+    ) -> list[tuple[str, float, dict]]:
+        """Find folders in database locations that are similar to the check folder"""
+        # Get folder candidates with file counts for smart filtering
+        folder_candidates = self._get_database_folder_candidates()
+
+        # Pre-filter candidates by size similarity (within 50% file count range)
+        check_file_count = len(folder_inventory)
+        min_files = max(1, int(check_file_count * 0.3))  # At least 30% of files
+        max_files = int(check_file_count * 3.0)  # At most 300% of files
+
+        filtered_candidates = []
+        for folder_path, file_count in folder_candidates:
+            if min_files <= file_count <= max_files:
+                filtered_candidates.append(folder_path)
+
+        self.ui.print_info(
+            f"Comparing against {len(filtered_candidates)} potential folders (filtered from {len(folder_candidates)})"
+        )
+
+        similar_folders = []
+
+        with self.ui.create_progress() as progress:
+            task = progress.add_task("Comparing with database folders...", total=len(filtered_candidates))
+
+            for candidate_folder in filtered_candidates:
+                progress.update(task, advance=1)
+
+                # Skip if it's the same folder
+                try:
+                    if pathlib.Path(candidate_folder).resolve() == check_folder.resolve():
+                        continue
+                except (OSError, ValueError):
+                    continue
+
+                # Get inventory for candidate folder (from cache)
+                candidate_inventory = self._get_folder_inventory_from_db(candidate_folder)
+
+                if not candidate_inventory:
+                    continue
+
+                # Quick size check before expensive similarity calculation
+                size_ratio = len(candidate_inventory) / len(folder_inventory)
+                if size_ratio < 0.5 or size_ratio > 2.0:
+                    continue
+
+                # Calculate similarity
+                similarity_score = self._calculate_folder_similarity(folder_inventory, candidate_inventory)
+
+                # Only include folders with >80% similarity
+                if similarity_score > 0.80:
+                    similar_folders.append((candidate_folder, similarity_score, candidate_inventory))
+
+        # Sort by similarity score (highest first)
+        similar_folders.sort(key=lambda x: x[1], reverse=True)
+        return similar_folders
+
+    def _get_database_folder_candidates(self, min_files: int = 5) -> list[tuple[str, int]]:
+        """Get folder paths from database with file counts for smart filtering"""
+        folders = {}
+
+        try:
+            with sqlite3.connect(self.cache_db) as conn:
+                # Get all file paths and group by folder
+                cursor = conn.execute("SELECT file_path FROM file_hashes")
+                for (file_path_str,) in cursor.fetchall():
+                    folder_path = str(pathlib.Path(file_path_str).parent)
+                    folders[folder_path] = folders.get(folder_path, 0) + 1
+        except sqlite3.Error:
+            pass
+
+        # Filter folders with minimum file count and sort by file count (larger first)
+        return sorted(
+            [(folder, count) for folder, count in folders.items() if count >= min_files],
+            key=lambda x: x[1],
+            reverse=True,
+        )
+
+    def _get_folder_inventory_from_db(self, folder_path: str) -> dict[str, dict]:
+        """Get folder inventory from database (faster than filesystem scan)"""
+        inventory = {}
+        folder_p = pathlib.Path(folder_path)
+
+        # Normalize folder path for database query
+        normalized_folder = str(folder_p).replace("/", "\\") if os.name == "nt" else str(folder_p).replace("\\", "/")
+
+        try:
+            with sqlite3.connect(self.cache_db) as conn:
+                # More efficient query - use GLOB for better path matching
+                cursor = conn.execute(
+                    "SELECT file_path, file_size, full_hash FROM file_hashes WHERE file_path GLOB ?",
+                    (f"{normalized_folder}*",),
+                )
+
+                for file_path_str, file_size, file_hash in cursor.fetchall():
+                    # Quick string check before path operations
+                    if not file_path_str.startswith(normalized_folder):
+                        continue
+
+                    try:
+                        file_path = pathlib.Path(file_path_str)
+                        rel_path = file_path.relative_to(folder_p)
+                        inventory[str(rel_path)] = {"hash": file_hash, "size": file_size, "full_path": file_path_str}
+                    except ValueError:
+                        continue
+
+        except sqlite3.Error:
+            pass
+
+        return inventory
+
+    def _calculate_folder_similarity(self, inventory1: dict[str, dict], inventory2: dict[str, dict]) -> float:
+        """Calculate similarity score between two folder inventories"""
+        if not inventory1 or not inventory2:
+            return 0.0
+
+        # Create sets of file hashes for comparison
+        hashes1 = {info["hash"] for info in inventory1.values()}
+        hashes2 = {info["hash"] for info in inventory2.values()}
+
+        # Calculate Jaccard similarity (intersection / union)
+        intersection = len(hashes1.intersection(hashes2))
+        union = len(hashes1.union(hashes2))
+
+        if union == 0:
+            return 0.0
+
+        return intersection / union
+
+    def _display_folder_similarity_results(
+        self,
+        check_folder: pathlib.Path,
+        folder_inventory: dict[str, dict],
+        similar_folders: list[tuple[str, float, dict]],
+    ):
+        """Display folder similarity results"""
+        if not similar_folders:
+            self.ui.print_success("No similar folders found")
+            return
+
+        total_size = sum(info["size"] for info in folder_inventory.values())
+        self.ui.print_info(f"Found {len(similar_folders)} similar folders")
+
+        for index, (folder_path, similarity_score, candidate_inventory) in enumerate(similar_folders, 1):
+            folder_display = format_path_for_display(folder_path)
+            candidate_size = sum(info["size"] for info in candidate_inventory.values())
+
+            self.ui.console.print(f"\n[{index}] {folder_display}", style="white")
+            self.ui.console.print(
+                f"    Similarity: {similarity_score:.1%} | Files: {len(candidate_inventory):,} | Size: {format_bytes(candidate_size)}",
+                style="white dim",
+            )
+
+            # Show shared files count
+            shared_hashes = {info["hash"] for info in folder_inventory.values()}.intersection(
+                {info["hash"] for info in candidate_inventory.values()}
+            )
+            only_in_check = len(folder_inventory) - len(shared_hashes)
+            only_in_candidate = len(candidate_inventory) - len(shared_hashes)
+
+            self.ui.console.print(
+                f"    Shared: {len(shared_hashes):,} files | Missing from candidate: {only_in_check:,} | Extra in candidate: {only_in_candidate:,}",
+                style="white dim",
+            )
+
+        self.ui.console.print(
+            f"\nChecked folder: {len(folder_inventory):,} files, {format_bytes(total_size)}", style="white dim"
+        )
 
     def cmd_status(self):
         """Show configuration and scan status"""
@@ -1270,97 +1560,60 @@ class Monosis:
             pass
 
     def _display_check_results(self, duplicates_found: dict, check_path: pathlib.Path):
-        """Display check results with categorization"""
+        """Display check results with detailed file information and enumeration"""
         if not duplicates_found:
-            self.ui.print_success("\n✅ No duplicates found!")
+            self.ui.print_success("No duplicates found")
             return
 
-        # Categorize results
-        safe_to_delete = []
-        review_needed = []
-        keep_files = []
+        total_duplicates = sum(len(info["duplicates"]) for info in duplicates_found.values())
+        self.ui.print_info(f"Found {len(duplicates_found)} files with {total_duplicates} duplicates")
 
-        for file_path, info in duplicates_found.items():
+        for file_index, (file_path, info) in enumerate(duplicates_found.items(), 1):
             file_p = pathlib.Path(file_path)
-            duplicate_locations = info["duplicates"]
 
-            # Determine category based on where duplicates are
-            has_reference = False
-            has_source = False
-            has_target = False
+            # Get file details for the checked file
+            try:
+                stat_info = file_p.stat()
+                size_str = format_bytes(info["size"])
+                mtime = datetime.fromtimestamp(stat_info.st_mtime, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            except OSError:
+                size_str = format_bytes(info["size"])
+                mtime = "unknown"
 
-            for dup_path in duplicate_locations:
-                if self.config.reference_location and dup_path.startswith(self.config.reference_location):
-                    has_reference = True
-                elif self.config.target_location and dup_path.startswith(self.config.target_location):
-                    has_target = True
-                else:
-                    # Check if it's in a source location
-                    for source_loc in self.config.source_locations:
-                        if dup_path.startswith(source_loc):
-                            has_source = True
-                            break
+            # Show the original file
+            try:
+                display_path = file_p.relative_to(check_path) if check_path in file_p.parents else str(file_p)
+            except ValueError:
+                display_path = str(file_p)
 
-            # Categorize
-            if has_reference:
-                safe_to_delete.append((file_p, info, "Backed up in reference location"))
-            elif has_source and not has_target:
-                review_needed.append((file_p, info, "Duplicate in another source location"))
-            elif has_target and not has_source:
-                keep_files.append((file_p, info, "Only in temporary target location"))
-            else:
-                review_needed.append((file_p, info, "Review duplicate locations"))
+            self.ui.console.print(f"\n[{file_index}] {display_path}", style="white")
+            self.ui.console.print(
+                f"    Hash: {info['hash'][:16]}... Size: {size_str} Modified: {mtime}", style="white dim"
+            )
 
-        # Display results
-        self.ui.print_info(f"\n=== Found {len(duplicates_found)} files with duplicates ===\n")
+            # Show enumerated duplicates with their details
+            for dup_index, dup_path in enumerate(info["duplicates"], 1):
+                try:
+                    dup_p = pathlib.Path(dup_path)
+                    dup_stat = dup_p.stat()
+                    dup_size_str = format_bytes(dup_stat.st_size)
+                    dup_mtime = datetime.fromtimestamp(dup_stat.st_mtime, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
-        # Show safe to delete files
-        if safe_to_delete:
-            self.ui.print_success(f"✅ SAFE TO DELETE ({len(safe_to_delete)} files)")
-            for file_p, info, reason in safe_to_delete[:10]:  # Show first 10
-                rel_path = file_p.relative_to(check_path) if check_path in file_p.parents else file_p.name
-                size_mb = info["size"] / (1024**2)
-                self.ui.console.print(f"  {rel_path} ({size_mb:.1f} MB)")
-                for dup in info["duplicates"][:3]:  # Show first 3 duplicates
-                    self.ui.console.print(f"    → {dup}", style="green dim")
-                self.ui.console.print(f"    [{reason}]", style="green dim")
-            if len(safe_to_delete) > 10:
-                self.ui.console.print(f"  ... and {len(safe_to_delete) - 10} more", style="dim")
+                    # Check if sizes match (they should for identical files)
+                    size_match = dup_stat.st_size == info["size"]
+                    size_indicator = "✓" if size_match else "✗"
 
-        # Show files needing review
-        if review_needed:
-            self.ui.print_warning(f"\n⚠️  REVIEW NEEDED ({len(review_needed)} files)")
-            for file_p, info, reason in review_needed[:10]:
-                rel_path = file_p.relative_to(check_path) if check_path in file_p.parents else file_p.name
-                size_mb = info["size"] / (1024**2)
-                self.ui.console.print(f"  {rel_path} ({size_mb:.1f} MB)")
-                for dup in info["duplicates"][:3]:
-                    self.ui.console.print(f"    → {dup}", style="yellow dim")
-                self.ui.console.print(f"    [{reason}]", style="yellow dim")
-            if len(review_needed) > 10:
-                self.ui.console.print(f"  ... and {len(review_needed) - 10} more", style="dim")
+                    self.ui.console.print(f"    {dup_index}. {dup_path}", style="white")
+                    self.ui.console.print(
+                        f"       Size: {dup_size_str} {size_indicator} Modified: {dup_mtime}", style="white dim"
+                    )
 
-        # Show files to keep
-        if keep_files:
-            self.ui.print_error(f"\n❌ KEEP THESE ({len(keep_files)} files)")
-            for file_p, info, reason in keep_files[:5]:
-                rel_path = file_p.relative_to(check_path) if check_path in file_p.parents else file_p.name
-                size_mb = info["size"] / (1024**2)
-                self.ui.console.print(f"  {rel_path} ({size_mb:.1f} MB)")
-                for dup in info["duplicates"][:2]:
-                    self.ui.console.print(f"    → {dup}", style="red dim")
-                self.ui.console.print(f"    [{reason}]", style="red dim")
-            if len(keep_files) > 5:
-                self.ui.console.print(f"  ... and {len(keep_files) - 5} more", style="dim")
+                except OSError:
+                    self.ui.console.print(f"    {dup_index}. {dup_path} (file not accessible)", style="red dim")
 
         # Summary
         total_size = sum(info["size"] for info in duplicates_found.values())
-        safe_size = sum(info["size"] for _, info, _ in safe_to_delete)
-
-        self.ui.print_info("\n=== Summary ===")
-        self.ui.console.print(f"Total duplicate size: {total_size / (1024**3):.2f} GB")
-        if safe_to_delete:
-            self.ui.console.print(f"Safe to reclaim: {safe_size / (1024**3):.2f} GB", style="green")
+        self.ui.console.print(f"\nTotal size of checked files: {format_bytes(total_size)}", style="white dim")
 
     def _cache_batch_hashes(self, file_paths: list[pathlib.Path], duplicates: dict):
         """Cache hashes for a batch of files to SQLite database"""

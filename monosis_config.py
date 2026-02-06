@@ -29,6 +29,7 @@ class MonosisConfig:
     min_file_size: int  # Minimum file size in bytes
     ignore_patterns: list[str]  # Glob patterns to ignore
     max_workers: int  # Maximum number of parallel hashing threads
+    cache_batch_size: int  # Number of hashes to compute before saving to database
 
     def add_source(self, path: pathlib.Path) -> bool:
         """Add a source location"""
@@ -90,6 +91,7 @@ class MonosisConfig:
             min_file_size=data.get("min_file_size", 1024),  # Default 1KB
             ignore_patterns=data.get("ignore_patterns", cls._default_ignore_patterns()),
             max_workers=data.get("max_workers", min(32, (os.cpu_count() or 1) + 4)),  # Default based on CPU cores
+            cache_batch_size=data.get("cache_batch_size", 10000),  # Default 10,000 hashes per batch
         )
 
     @classmethod
@@ -131,6 +133,7 @@ class MonosisConfig:
             min_file_size=1024,  # 1KB minimum
             ignore_patterns=cls._default_ignore_patterns(),
             max_workers=min(32, (os.cpu_count() or 1) + 4),  # Default based on CPU cores
+            cache_batch_size=10000,  # Default 10,000 hashes per batch
         )
 
 
@@ -147,35 +150,34 @@ class ConfigManager:
         self.shared_manager = SharedConfigManager()
         self.config_dir = self.shared_manager.kosmos_dir  # For compatibility
         self.config_file = self.shared_manager.config_file  # For compatibility
-        
+
         # Initialize shared cache database
         init_shared_cache_db(self.shared_manager.get_cache_db_path())
-        
+
         # Migrate old monosis config if exists
         self.shared_manager.migrate_from_monosis()
 
     def load(self) -> MonosisConfig:
         """Load configuration from shared kosmos config"""
         kosmos_config = self.shared_manager.load()
-        
+
         # Get monosis-specific config
         monosis_data = kosmos_config.monosis
-        
+
         if monosis_data:
             return MonosisConfig.from_dict(monosis_data)
-        else:
-            return MonosisConfig.default()
+        return MonosisConfig.default()
 
     def save(self, config: MonosisConfig):
         """Save configuration to shared kosmos config"""
         kosmos_config = self.shared_manager.load()
-        
+
         # Update monosis section
         kosmos_config.monosis = config.to_dict()
-        
+
         # Save back to shared config
         self.shared_manager.save(kosmos_config)
-    
+
     def get_cache_db_path(self) -> pathlib.Path:
         """Get path to shared hash cache database"""
         return self.shared_manager.get_cache_db_path()

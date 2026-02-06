@@ -21,7 +21,6 @@ class FileIndexer:
     def __init__(
         self,
         cache_file: pathlib.Path,
-        min_file_size: int = 1024,
         ignore_patterns: Optional[list[str]] = None,
         progress_callback: Optional[Callable] = None,
     ):
@@ -29,14 +28,13 @@ class FileIndexer:
 
         Args:
             cache_file: Path to the index cache file
-            min_file_size: Minimum file size in bytes to index
             ignore_patterns: List of glob patterns to ignore
             progress_callback: Optional callback for progress updates
         """
         self.cache_file = cache_file
-        self.min_file_size = min_file_size
         self.ignore_patterns = ignore_patterns or []
         self.progress_callback = progress_callback
+        self.shutdown_requested = None  # Callable that returns True if shutdown requested
 
     def discover_files(
         self,
@@ -60,6 +58,10 @@ class FileIndexer:
         }
 
         for location_type, location_str, location_path in locations:
+            # Check for shutdown before processing each location
+            if self.shutdown_requested and self.shutdown_requested():
+                break
+
             location_files = []
             location_size = 0
 
@@ -67,6 +69,10 @@ class FileIndexer:
             if recursive:
                 # Recursive scan using os.walk
                 for root, _dirs, files in os.walk(location_path):
+                    # Check for shutdown during scanning
+                    if self.shutdown_requested and self.shutdown_requested():
+                        break
+
                     for filename in files:
                         file_path = pathlib.Path(root) / filename
 
@@ -78,7 +84,9 @@ class FileIndexer:
                             # Notify progress periodically
                             if self.progress_callback and len(location_files) % 1000 == 0:
                                 total_files_so_far = file_inventory["total_files"] + len(location_files)
-                                self.progress_callback(location_str, len(location_files), total_files_so_far)
+                                self.progress_callback(
+                                    location_str, len(location_files), total_files_so_far, final=False
+                                )
             else:
                 # Non-recursive scan
                 try:
@@ -92,7 +100,9 @@ class FileIndexer:
                                 # Notify progress periodically
                                 if self.progress_callback and len(location_files) % 1000 == 0:
                                     total_files_so_far = file_inventory["total_files"] + len(location_files)
-                                    self.progress_callback(location_str, len(location_files), total_files_so_far)
+                                    self.progress_callback(
+                                        location_str, len(location_files), total_files_so_far, final=False
+                                    )
                 except (OSError, PermissionError):
                     pass  # Skip inaccessible directories
 
@@ -131,7 +141,7 @@ class FileIndexer:
             file_mtime = stat_result.st_mtime
 
             # Apply filtering
-            if self._should_ignore_file(file_path, file_size):
+            if self._should_ignore_file(file_path):
                 return None
 
             return {
@@ -144,21 +154,16 @@ class FileIndexer:
         except (OSError, PermissionError):
             return None
 
-    def _should_ignore_file(self, file_path: pathlib.Path, file_size: int) -> bool:
+    def _should_ignore_file(self, file_path: pathlib.Path) -> bool:
         """Check if a file should be ignored based on filters
 
         Args:
             file_path: Path to the file
-            file_size: Size of the file in bytes
 
         Returns:
             True if file should be ignored, False otherwise
         """
-        # Check minimum file size
-        if file_size < self.min_file_size:
-            return True
-
-        # Check ignore patterns
+        # Check ignore patterns only - no size filtering
         file_str = str(file_path)
         for pattern in self.ignore_patterns:
             if fnmatch.fnmatch(file_str, pattern) or fnmatch.fnmatch(file_path.name, pattern):
