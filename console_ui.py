@@ -7,7 +7,7 @@ panels, and interactive prompts. Designed to be reusable across different CLI ap
 """
 
 import sys
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Optional
 
 from rich import box
 from rich.columns import Columns
@@ -73,9 +73,8 @@ class ConsoleUI:
         table.add_column("Value", style="cyan", min_width=30)
 
         for key, value in config.items():
-            if isinstance(value, list):
-                value = ", ".join(str(v) for v in value)
-            table.add_row(key, str(value))
+            display_value = ", ".join(str(v) for v in value) if isinstance(value, list) else str(value)
+            table.add_row(key, display_value)
 
         self.console.print(table)
 

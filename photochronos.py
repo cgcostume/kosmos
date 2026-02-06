@@ -20,12 +20,8 @@ import os
 import pathlib
 import sys
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
-
-# Third-party imports
-import exifread
-from tzlocal import get_localzone
 
 from console_ui import ConsoleUI
 
@@ -41,13 +37,7 @@ if sys.platform == "win32":
 
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 
-# Windows-specific imports for video metadata
-try:
-    from win32com.propsys import propsys, pscon
-
-    WINDOWS_METADATA = True
-except ImportError:
-    WINDOWS_METADATA = False
+WINDOWS_METADATA = sys.platform == "win32"
 
 # Configuration constants
 COUNTER_FORMAT = "02d"
@@ -99,7 +89,7 @@ class FileInfo:
     file_hash: Optional[str] = None
     is_duplicate: bool = False
     duplicate_of: Optional[pathlib.Path] = None
-    issues: list[str] = None
+    issues: list[str] = field(default_factory=list)
     is_external: bool = False  # True if photo is from external source (not family camera)
     external_reason: Optional[str] = None  # Reason why marked as external
     camera_make: Optional[str] = None
@@ -107,9 +97,6 @@ class FileInfo:
     software: Optional[str] = None
     exif_completeness: float = 0.0  # Score 0-1 indicating EXIF data completeness
 
-    def __post_init__(self):
-        if self.issues is None:
-            self.issues = []
 
 
 class PhotoChronos:
@@ -427,7 +414,7 @@ class PhotoChronos:
                 # Check if this could be a duplicate by looking for existing file with same name
                 # We need to check if the file might already exist on disk even if not in batch yet
                 if target_path.exists():
-                    duplicate_result = self._check_for_duplicate(file_info, target_path)
+                    duplicate_result = self._is_already_duplicate(file_info)
                     if duplicate_result:
                         return new_name, pathlib.Path()  # It's a duplicate
                 new_name = self._increment_filename(base_new_name, counter)
@@ -442,7 +429,7 @@ class PhotoChronos:
                     return new_name, target_path
 
                 # Different source file - check if it's a duplicate by content
-                duplicate_result = self._check_for_duplicate(file_info, target_path)
+                duplicate_result = self._is_already_duplicate(file_info)
                 if duplicate_result:
                     # For duplicates, return empty path to signal no move needed
                     return new_name, pathlib.Path()  # It's a duplicate
@@ -486,12 +473,8 @@ class PhotoChronos:
                         except Exception as e:
                             file2.issues.append(f"Duplicate check failed: {e}")
 
-    def _check_for_duplicate(self, file_info: FileInfo, target_path: pathlib.Path) -> bool:
-        """Check if file is duplicate and mark it if so. Returns True if duplicate."""
-        # If already marked as duplicate by comprehensive check, respect that
-        # CRITICAL: Do NOT check duplicates during planning phase
-        # All duplicate detection should happen in _detect_content_duplicates
-        # This prevents symmetric duplicate marking bugs
+    def _is_already_duplicate(self, file_info: FileInfo) -> bool:
+        """Check if file was already marked as duplicate by _detect_content_duplicates."""
         return file_info.is_duplicate
 
     def plan_renames(self, files: list[FileInfo]) -> dict[str, FileInfo]:
@@ -778,13 +761,6 @@ class PhotoChronos:
         file_mappings = {file_info.path: file_info.target_path for file_info in planned_operations.values()}
         operations = self.file_operations.plan_batch_operations(file_mappings, operation_type)
 
-        # Set up progress callback
-        def progress_callback(message):
-            # This could update a progress bar if needed
-            pass
-
-        self.file_operations.progress_callback = progress_callback
-
         # Execute operations with Rich progress bar
         with self.ui.create_progress() as progress:
             task = progress.add_task("Processing files...", total=len(operations))
@@ -1027,8 +1003,6 @@ def main():
         return 0
     app.ui.print_error("Some operations failed - check error messages above")
     return 1
-
-    return 0
 
 
 if __name__ == "__main__":

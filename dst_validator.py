@@ -5,7 +5,7 @@ Validates if time differences between timestamps match actual DST transitions.
 """
 
 import datetime
-from typing import Optional, Tuple
+from typing import Optional
 from zoneinfo import ZoneInfo
 
 
