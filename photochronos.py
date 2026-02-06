@@ -27,7 +27,7 @@ from console_ui import ConsoleUI
 
 # Local imports
 from duplicate_detector import DuplicateDetector
-from file_analyzer import FileAnalysisResult, FileAnalyzer
+from file_analyzer import FFPROBE_AVAILABLE, FileAnalysisResult, FileAnalyzer
 from file_operations import FileOperations, OperationType
 from kosmos_config import SharedConfigManager, init_shared_cache_db
 
@@ -96,7 +96,6 @@ class FileInfo:
     camera_model: Optional[str] = None
     software: Optional[str] = None
     exif_completeness: float = 0.0  # Score 0-1 indicating EXIF data completeness
-
 
 
 class PhotoChronos:
@@ -835,8 +834,12 @@ class PhotoChronos:
         if self.args.family_devices:
             config["Additional family devices"] = ", ".join(self.args.family_devices)
 
-        if not WINDOWS_METADATA:
-            config["Video metadata"] = "Limited (Windows COM not available)"
+        if FFPROBE_AVAILABLE:
+            config["Video metadata"] = "Full (ffprobe)"
+        elif WINDOWS_METADATA:
+            config["Video metadata"] = "Full (Windows COM)"
+        else:
+            config["Video metadata"] = "Limited (no ffprobe or Windows COM)"
 
         # Show cache stats if there are cached hashes
         cache_stats = self.duplicate_detector.get_cache_stats()

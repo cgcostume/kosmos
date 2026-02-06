@@ -7,7 +7,10 @@ images and videos. Extracts creation dates, EXIF data, and other file properties
 """
 
 import datetime
+import json
 import pathlib
+import shutil
+import subprocess
 import sys
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -18,6 +21,9 @@ from tzlocal import get_localzone
 
 # DST validation
 from dst_validator import is_valid_dst_difference
+
+# ffprobe availability (cross-platform video metadata)
+FFPROBE_AVAILABLE = shutil.which("ffprobe") is not None
 
 # Windows-specific imports for video metadata
 try:
@@ -163,13 +169,97 @@ class FileAnalyzer:
     def _extract_date_from_video(
         self, file_path: pathlib.Path, result: FileAnalysisResult
     ) -> Optional[datetime.datetime]:
-        """Extract creation date from video metadata with validation against file system dates"""
-        if not WINDOWS_METADATA:
-            result.issues.append("Video metadata not available (Windows COM required)")
-            return None
+        """Extract creation date from video metadata with validation against file system dates.
 
+        Tries ffprobe first (cross-platform), then Windows COM as fallback.
+        """
+        # Try ffprobe first (works on any platform with ffmpeg installed)
+        if FFPROBE_AVAILABLE:
+            date = self._extract_date_from_video_ffprobe(file_path, result)
+            if date:
+                return date
+
+        # Fall back to Windows COM
+        if WINDOWS_METADATA:
+            date = self._extract_date_from_video_windows(file_path, result)
+            if date:
+                return date
+
+        if not FFPROBE_AVAILABLE and not WINDOWS_METADATA:
+            result.issues.append("Video metadata not available (no ffprobe or Windows COM)")
+
+        return None
+
+    def _extract_date_from_video_ffprobe(
+        self, file_path: pathlib.Path, result: FileAnalysisResult
+    ) -> Optional[datetime.datetime]:
+        """Extract creation date from video metadata using ffprobe"""
         try:
-            # Windows-specific video metadata extraction
+            proc = subprocess.run(
+                ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", "-show_streams", str(file_path)],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+
+            if proc.returncode != 0:
+                return None
+
+            probe_data = json.loads(proc.stdout)
+
+            # Look for creation_time in format tags first, then stream tags
+            creation_time_str = None
+
+            format_tags = probe_data.get("format", {}).get("tags", {})
+            # Tag keys can vary in case
+            for key, value in format_tags.items():
+                if key.lower() == "creation_time":
+                    creation_time_str = value
+                    break
+
+            if not creation_time_str:
+                for stream in probe_data.get("streams", []):
+                    stream_tags = stream.get("tags", {})
+                    for key, value in stream_tags.items():
+                        if key.lower() == "creation_time":
+                            creation_time_str = value
+                            break
+                    if creation_time_str:
+                        break
+
+            if not creation_time_str:
+                return None
+
+            # Parse the UTC timestamp (typically ISO 8601: 2025-07-05T18:36:10.000000Z)
+            # Strip trailing Z and fractional seconds for consistent parsing
+            clean_str = creation_time_str.replace("Z", "+00:00")
+            utc_dt = datetime.datetime.fromisoformat(clean_str)
+
+            # Convert UTC to local naive datetime
+            if utc_dt.tzinfo is not None:
+                local_dt = utc_dt.astimezone(self.timezone)
+                naive_date = local_dt.replace(tzinfo=None)
+            else:
+                naive_date = utc_dt
+
+            # Validate against file system dates (same logic as Windows path)
+            return self._validate_video_date(naive_date, file_path, result)
+
+        except subprocess.TimeoutExpired:
+            result.issues.append("ffprobe timed out reading video metadata")
+        except (json.JSONDecodeError, ValueError, KeyError) as e:
+            result.issues.append(f"Could not parse ffprobe output: {e}")
+        except Exception as e:
+            result.issues.append(f"ffprobe extraction failed: {e}")
+
+        return None
+
+    def _extract_date_from_video_windows(
+        self, file_path: pathlib.Path, result: FileAnalysisResult
+    ) -> Optional[datetime.datetime]:
+        """Extract creation date from video metadata using Windows COM"""
+        try:
             from win32com.propsys import propsys, pscon
 
             properties = propsys.SHGetPropertyStoreFromParsingName(str(file_path.absolute()))
@@ -182,43 +272,49 @@ class FileAnalyzer:
                 else:
                     naive_date = date_created
 
-                # Validate against file system dates
-                file_modified = result.date_modified
-                file_created = result.date_created
-
-                # Check against file system date for timezone issues
-                is_valid_fs, explanation_fs = is_valid_dst_difference(naive_date, file_modified)
-                if is_valid_fs:
-                    result.issues.append(f"Video metadata timezone issue: {explanation_fs}, using file system date")
-                    return file_modified
-
-                # Check against filename time if parseable
-                try:
-                    filename_stem = file_path.stem
-                    if len(filename_stem) >= 15 and filename_stem[:8].isdigit() and filename_stem[9:15].isdigit():
-                        expected_time = datetime.datetime.strptime(filename_stem[:15], "%Y%m%d_%H%M%S")
-                        is_valid_fn, explanation_fn = is_valid_dst_difference(naive_date, expected_time)
-                        if is_valid_fn:
-                            result.issues.append(
-                                f"Video metadata timezone issue: {explanation_fn}, using filename time"
-                            )
-                            return expected_time
-                except (ValueError, IndexError):
-                    pass  # Filename not in expected format
-
-                # Check if metadata date is significantly newer (file was copied after creation)
-                if naive_date > file_modified + datetime.timedelta(days=1):
-                    result.issues.append(
-                        f"Video metadata date ({naive_date.strftime('%Y-%m-%d')}) newer than file modified date ({file_modified.strftime('%Y-%m-%d')}), using file system date"
-                    )
-                    return min(file_created, file_modified)
-
-                return naive_date
+                return self._validate_video_date(naive_date, file_path, result)
 
         except Exception as e:
             result.issues.append(f"Could not read video metadata: {e}")
 
         return None
+
+    def _validate_video_date(
+        self,
+        naive_date: datetime.datetime,
+        file_path: pathlib.Path,
+        result: FileAnalysisResult,
+    ) -> datetime.datetime:
+        """Validate extracted video date against file system dates and filename"""
+        file_modified = result.date_modified
+        file_created = result.date_created
+
+        # Check against file system date for timezone issues
+        is_valid_fs, explanation_fs = is_valid_dst_difference(naive_date, file_modified)
+        if is_valid_fs:
+            result.issues.append(f"Video metadata timezone issue: {explanation_fs}, using file system date")
+            return file_modified
+
+        # Check against filename time if parseable
+        try:
+            filename_stem = file_path.stem
+            if len(filename_stem) >= 15 and filename_stem[:8].isdigit() and filename_stem[9:15].isdigit():
+                expected_time = datetime.datetime.strptime(filename_stem[:15], "%Y%m%d_%H%M%S")
+                is_valid_fn, explanation_fn = is_valid_dst_difference(naive_date, expected_time)
+                if is_valid_fn:
+                    result.issues.append(f"Video metadata timezone issue: {explanation_fn}, using filename time")
+                    return expected_time
+        except (ValueError, IndexError):
+            pass  # Filename not in expected format
+
+        # Check if metadata date is significantly newer (file was copied after creation)
+        if naive_date > file_modified + datetime.timedelta(days=1):
+            result.issues.append(
+                f"Video metadata date ({naive_date.strftime('%Y-%m-%d')}) newer than file modified date ({file_modified.strftime('%Y-%m-%d')}), using file system date"
+            )
+            return min(file_created, file_modified)
+
+        return naive_date
 
     def _is_image_file(self, file_path: pathlib.Path) -> bool:
         """Check if file is an image based on extension"""
