@@ -410,12 +410,13 @@ class PhotoChronos:
 
             # Check if already used in current batch
             if target_path_str in used_target_paths:
-                # Check if this could be a duplicate by looking for existing file with same name
-                # We need to check if the file might already exist on disk even if not in batch yet
                 if target_path.exists():
-                    duplicate_result = self._is_already_duplicate(file_info)
-                    if duplicate_result:
-                        return new_name, pathlib.Path()  # It's a duplicate
+                    # Check batch duplicate flag first (cheap)
+                    if self._is_already_duplicate(file_info):
+                        return new_name, pathlib.Path()  # Batch duplicate
+                    # Compare content against existing target file
+                    if self._check_identical_to_target(file_info, target_path):
+                        return new_name, pathlib.Path()  # Already at target
                 new_name = self._increment_filename(base_new_name, counter)
                 counter += 1
                 continue
@@ -427,11 +428,14 @@ class PhotoChronos:
                     # Same file, already in correct location - no processing needed
                     return new_name, target_path
 
-                # Different source file - check if it's a duplicate by content
-                duplicate_result = self._is_already_duplicate(file_info)
-                if duplicate_result:
-                    # For duplicates, return empty path to signal no move needed
-                    return new_name, pathlib.Path()  # It's a duplicate
+                # Check batch duplicate flag first (cheap)
+                if self._is_already_duplicate(file_info):
+                    return new_name, pathlib.Path()  # Batch duplicate
+
+                # Compare content against existing target file
+                if self._check_identical_to_target(file_info, target_path):
+                    return new_name, pathlib.Path()  # Already at target
+
                 # Different file with same name - increment and try again
                 new_name = self._increment_filename(base_new_name, counter)
                 counter += 1
@@ -441,40 +445,56 @@ class PhotoChronos:
             return new_name, target_path
 
     def _detect_content_duplicates(self, files: list[FileInfo]):
-        """Detect content duplicates efficiently by grouping files with same target names"""
-        # Group files by their target filename (efficient O(n) grouping)
+        """Detect content duplicates efficiently by grouping files with same target names.
+
+        Strategy: group by target filename (O(n)), then within each group hash each file
+        once and group by hash (O(k) per group) to find duplicates without pairwise comparison.
+        """
+        # Group files by their target filename - O(n)
         target_name_groups = defaultdict(list)
         for file_info in files:
             target_name = self.generate_new_filename(file_info)
             target_name_groups[target_name].append(file_info)
 
-        # Only check duplicates within groups that would conflict (efficient)
+        # Within each group that has potential conflicts, hash and group - O(k) per group
         for _target_name, file_group in target_name_groups.items():
-            if len(file_group) > 1:
-                # Sort by path for consistent ordering
-                file_group.sort(key=lambda f: str(f.path))
+            if len(file_group) <= 1:
+                continue
 
-                # Check each file against others in the same target group
-                for i, file1 in enumerate(file_group):
-                    if file1.is_duplicate:
-                        continue
+            # Hash each file once and group by hash
+            hash_groups: dict[str, list[FileInfo]] = defaultdict(list)
+            for file_info in file_group:
+                try:
+                    file_hash = self.duplicate_detector.calculate_file_hash(file_info.path)
+                    hash_groups[file_hash].append(file_info)
+                except Exception as e:
+                    file_info.issues.append(f"Duplicate check failed: {e}")
 
-                    for file2 in file_group[i + 1 :]:
-                        if file2.is_duplicate:
-                            continue
-
-                        try:
-                            if self.duplicate_detector.files_are_identical(file1.path, file2.path):
-                                # Mark the second file as duplicate (consistent with sort order)
-                                file2.is_duplicate = True
-                                file2.duplicate_of = file1.path
-                                break  # file1 found its duplicate, move to next file1
-                        except Exception as e:
-                            file2.issues.append(f"Duplicate check failed: {e}")
+            # Within each hash group, keep the first (by path order), mark rest as duplicates
+            for _hash_val, identical_files in hash_groups.items():
+                if len(identical_files) <= 1:
+                    continue
+                identical_files.sort(key=lambda f: str(f.path))
+                original = identical_files[0]
+                for duplicate in identical_files[1:]:
+                    duplicate.is_duplicate = True
+                    duplicate.duplicate_of = original.path
 
     def _is_already_duplicate(self, file_info: FileInfo) -> bool:
         """Check if file was already marked as duplicate by _detect_content_duplicates."""
         return file_info.is_duplicate
+
+    def _check_identical_to_target(self, file_info: FileInfo, target_path: pathlib.Path) -> bool:
+        """Compare source file content against an existing target file.
+        If identical, mark source as duplicate of the target for cleanup."""
+        try:
+            if self.duplicate_detector.files_are_identical(file_info.path, target_path):
+                file_info.is_duplicate = True
+                file_info.duplicate_of = target_path
+                return True
+        except Exception as e:
+            file_info.issues.append(f"Target comparison failed: {e}")
+        return False
 
     def plan_renames(self, files: list[FileInfo]) -> dict[str, FileInfo]:
         """Plan renames with conflict resolution"""

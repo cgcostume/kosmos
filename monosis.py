@@ -366,8 +366,8 @@ class Monosis:
     def cmd_scan(self):
         """Scan configured locations for duplicates using two-phase approach"""
         # Check if locations are configured
-        if not self.config.source_locations:
-            self.ui.print_error("No source locations configured. Use 'monosis locations add' first.")
+        if not self.config.source_locations and not self.config.reference_location:
+            self.ui.print_error("No locations configured. Use 'monosis locations add' or 'monosis locations reference' first.")
             return False
 
         # Phase 1: Discovery

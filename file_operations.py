@@ -59,7 +59,7 @@ class FileOperations:
 
             if operation.operation_type == OperationType.COPY:
                 # Copy mode - always copy, preserve original
-                shutil.copy2(operation.source_path, operation.target_path)
+                self._safe_copy(operation.source_path, operation.target_path)
 
             elif operation.operation_type == OperationType.MOVE:
                 # Move mode - try rename first, fallback to copy+delete for cross-drive
@@ -68,7 +68,7 @@ class FileOperations:
                 except OSError as rename_error:
                     if self._is_cross_drive_error(rename_error):
                         # Cross-drive operation - use copy + delete
-                        shutil.copy2(operation.source_path, operation.target_path)
+                        self._safe_copy(operation.source_path, operation.target_path)
                         operation.source_path.unlink()  # Delete original after successful copy
                     else:
                         raise  # Re-raise if it's a different error
@@ -100,6 +100,10 @@ class FileOperations:
             else:
                 failed_operations.append(result)
 
+        # Clean up empty source directories after successful move operations
+        if successful_operations:
+            self._cleanup_empty_directories(successful_operations)
+
         return successful_operations, failed_operations
 
     def plan_operation(
@@ -123,12 +127,39 @@ class FileOperations:
             operations.append(operation)
         return operations
 
+    def _cleanup_empty_directories(self, results: list[OperationResult]):
+        """Remove empty source directories after successful move operations (bottom-up)"""
+        # Collect unique source directories from successful moves
+        source_dirs: set[pathlib.Path] = set()
+        for result in results:
+            if result.operation.operation_type == OperationType.MOVE:
+                source_dirs.add(result.operation.source_path.parent)
+
+        if not source_dirs:
+            return
+
+        # Sort deepest first so children are removed before parents
+        for directory in sorted(source_dirs, key=lambda d: len(d.parts), reverse=True):
+            try:
+                if directory.exists() and directory.is_dir() and not any(directory.iterdir()):
+                    directory.rmdir()
+            except OSError:
+                pass  # Directory not empty or permission denied — skip silently
+
+    def _safe_copy(self, source: pathlib.Path, target: pathlib.Path):
+        """Copy a file, falling back to metadata-less copy if needed (e.g. on SMB/CIFS mounts)"""
+        try:
+            shutil.copy2(source, target)
+        except (OSError, PermissionError):
+            # copy2 failed on metadata preservation — fall back to content-only copy
+            shutil.copy(source, target)
+
     def _is_cross_drive_error(self, error: OSError) -> bool:
         """Check if the error indicates a cross-drive operation"""
         error_str = str(error).lower()
         return (
             "different disk drive" in error_str
-            or error.errno == 17  # Cross-device link error
+            or error.errno == 18  # EXDEV - Cross-device link (Linux/macOS)
             or "cross-device link" in error_str
         )
 
