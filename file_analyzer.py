@@ -140,8 +140,17 @@ class FileAnalyzer:
                 for tag_name in date_tags:
                     if tag_name in tags:
                         try:
-                            date_str = str(tags[tag_name])
-                            return datetime.datetime.strptime(date_str, "%Y:%m:%d %H:%M:%S")
+                            date_str = str(tags[tag_name]).strip()[:19]
+                            try:
+                                return datetime.datetime.strptime(date_str, "%Y:%m:%d %H:%M:%S")
+                            except ValueError:
+                                # Try clamping out-of-range seconds (some cameras write invalid values)
+                                parts = date_str.split(":")
+                                if len(parts) == 5:
+                                    seconds = min(int(parts[4]), 59)
+                                    parts[4] = f"{seconds:02d}"
+                                    return datetime.datetime.strptime(":".join(parts), "%Y:%m:%d %H:%M:%S")
+                                raise
                         except ValueError as e:
                             result.issues.append(f"Invalid date format in {tag_name}: {e}")
                             continue
