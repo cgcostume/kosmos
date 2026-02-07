@@ -88,8 +88,12 @@ class Monosis:
 
     def _signal_handler(self, signum, frame):
         """Handle shutdown signals gracefully"""
+        if self._shutdown_requested:
+            # Second signal — force exit immediately
+            sys.exit(1)
+
         self._shutdown_requested = True
-        self.ui.print_warning("\nShutdown requested... saving current progress and exiting.")
+        self.ui.print_warning("\nShutdown requested... press Ctrl+C again to force quit.")
 
         # Ensure cache directory exists
         self.cache_dir.mkdir(exist_ok=True)
@@ -99,6 +103,8 @@ class Monosis:
 
         # Load existing cache into DuplicateDetector
         self._load_cache_into_detector()
+
+        sys.exit(0)
 
     def _init_cache_db(self):
         """Initialize SQLite cache database - now handled by shared config"""
