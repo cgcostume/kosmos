@@ -21,7 +21,7 @@ class KosmosConfig:
     version: str = "1.0"
     monosis: dict = field(default_factory=dict)
     photochronos: dict = field(default_factory=dict)
-    # Future tools can be added here
+    katharos: dict = field(default_factory=dict)
 
     def get_tool_config(self, tool_name: str) -> dict:
         """Get configuration for a specific tool"""
@@ -42,6 +42,7 @@ class KosmosConfig:
             version=data.get("version", "1.0"),
             monosis=data.get("monosis", {}),
             photochronos=data.get("photochronos", {}),
+            katharos=data.get("katharos", {}),
         )
 
 
